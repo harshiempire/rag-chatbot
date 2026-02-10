@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+anthropic
+openai
+requests
+pandas
+python-dotenv
+cryptography
+psycopg2-binary
+pgvector
+langchain
+langchain-text-splitters
+sentence-transformers
+google-genai
