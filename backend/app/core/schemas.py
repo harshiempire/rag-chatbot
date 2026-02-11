@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, validator
 
 from app.core.enums import (
     AuthType,
+    ChunkingStrategy,
     DataClassification,
     EmbeddingModel,
     LLMProvider,
@@ -92,12 +93,14 @@ class ChunkingConfig(BaseModel):
     """Text chunking configuration"""
     chunk_size: int = 1000
     chunk_overlap: int = 200
+    min_chunk_size: int = 200
 
 
 class VectorizationConfig(BaseModel):
     """Vectorization configuration"""
     embedding_model: EmbeddingModel = EmbeddingModel.SENTENCE_TRANSFORMERS
     batch_size: int = 100
+    chunking_strategy: ChunkingStrategy = ChunkingStrategy.AUTO
 
 
 class ReviewDecision(BaseModel):
@@ -125,3 +128,7 @@ class RAGResponse(BaseModel):
     sources: List[Dict[str, Any]]
     classification: DataClassification
     llm_provider: LLMProvider
+    retrieved_count: int
+    prompt_context_count: int
+    total_ms: float
+    timings_ms: Dict[str, float]

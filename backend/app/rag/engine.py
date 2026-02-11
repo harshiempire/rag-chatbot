@@ -9,6 +9,7 @@ Supports OpenAI, Anthropic, Google Gemini, OpenRouter, and local Ollama.
 import json
 import logging
 import os
+import time
 from typing import Dict, List
 
 import anthropic
@@ -20,12 +21,13 @@ from google import genai
 from app.core.database import VectorDatabase
 from app.core.enums import DataClassification, LLMProvider
 from app.core.schemas import RAGQuery, RAGResponse
-from app.vectorization.engine import VectorizationEngine
+from app.vectorization.engine import DEFAULT_EMBEDDING_MODEL, VectorizationEngine
 
 logger = logging.getLogger(__name__)
 
-# RAG prompt caps (to avoid local LLM timeouts)
-MAX_TOP_K = int(os.getenv("RAG_MAX_TOP_K", "3"))
+# Retrieval/prompt caps
+RAG_RETRIEVE_K = int(os.getenv("RAG_RETRIEVE_K", "8"))
+RAG_PROMPT_K = int(os.getenv("RAG_PROMPT_K", "3"))
 MAX_CHUNK_CHARS = int(os.getenv("RAG_MAX_CHUNK_CHARS", "1200"))
 MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "6000"))
 
@@ -50,23 +52,27 @@ class RAGEngine:
 
     def query(self, rag_query: RAGQuery, user_id: str) -> RAGResponse:
         """Execute RAG query with security"""
+        total_start = time.perf_counter()
+        timings_ms: Dict[str, float] = {}
 
         # Validate LLM provider based on classification
         classifications = rag_query.classification_filter or [DataClassification.PUBLIC]
         self._validate_llm_access(rag_query.llm_provider, classifications)
 
-        # Generate query embedding (lazy init to avoid startup blocking)
-        if self.vectorization is None:
-            self.vectorization = VectorizationEngine()
-        query_embedding = self.vectorization.generate_embeddings([rag_query.question])[0]
+        embed_start = time.perf_counter()
+        query_embedding = self.get_query_embedding(rag_query.question)
+        timings_ms["embed"] = round((time.perf_counter() - embed_start) * 1000, 2)
 
         # Search similar chunks
+        search_start = time.perf_counter()
+        retrieval_k = min(max(rag_query.top_k, 1), RAG_RETRIEVE_K)
         results = self.vector_db.similarity_search(
             query_embedding,
             [c.value for c in classifications],
-            rag_query.top_k,
+            retrieval_k,
             rag_query.min_similarity
         )
+        timings_ms["search"] = round((time.perf_counter() - search_start) * 1000, 2)
 
         if not results:
             raise HTTPException(status_code=404, detail="No relevant documents found")
@@ -74,20 +80,36 @@ class RAGEngine:
         # Get max classification
         max_class = self._get_max_classification([r['classification'] for r in results])
 
-        # Generate answer
-        answer = self._generate_answer(rag_query, results)
+        prompt_start = time.perf_counter()
+        prompt, prompt_context_count = self._build_prompt(rag_query.question, results)
+        timings_ms["prompt_build"] = round((time.perf_counter() - prompt_start) * 1000, 2)
+
+        llm_start = time.perf_counter()
+        answer = self._generate_answer(rag_query, prompt)
+        timings_ms["llm"] = round((time.perf_counter() - llm_start) * 1000, 2)
+        total_ms = round((time.perf_counter() - total_start) * 1000, 2)
+        timings_ms["total"] = total_ms
 
         # Audit log
         self.vector_db.log_query(
             user_id, rag_query.question, rag_query.llm_provider.value,
-            max_class.value, True
+            max_class.value, True,
+            details={
+                "retrieved_count": len(results),
+                "prompt_context_count": prompt_context_count,
+                "timings_ms": timings_ms,
+            }
         )
 
         return RAGResponse(
             answer=answer,
             sources=results,
             classification=max_class,
-            llm_provider=rag_query.llm_provider
+            llm_provider=rag_query.llm_provider,
+            retrieved_count=len(results),
+            prompt_context_count=prompt_context_count,
+            total_ms=total_ms,
+            timings_ms=timings_ms,
         )
 
     def _validate_llm_access(self, llm_provider: LLMProvider, classifications: List[DataClassification]):
@@ -110,11 +132,18 @@ class RAGEngine:
                 return DataClassification(name)
         return DataClassification.PUBLIC
 
-    def _build_prompt(self, question: str, context_chunks: List[Dict]) -> str:
+    def get_query_embedding(self, question: str) -> List[float]:
+        """Generate query embedding with canonical embedding model."""
+        if self.vectorization is None:
+            self.vectorization = VectorizationEngine(DEFAULT_EMBEDDING_MODEL)
+        return self.vectorization.generate_embeddings([question])[0]
+
+    def _build_prompt(self, question: str, context_chunks: List[Dict]) -> tuple[str, int]:
         """Build the RAG prompt from context chunks"""
-        chunks = context_chunks[:min(len(context_chunks), MAX_TOP_K)]
+        chunks = context_chunks[:min(len(context_chunks), RAG_PROMPT_K)]
         parts = []
         total = 0
+        used = 0
         for i, chunk in enumerate(chunks):
             text = (chunk.get("content") or "").strip()
             if not text:
@@ -128,9 +157,10 @@ class RAGEngine:
                 break
             parts.append(block)
             total += len(block)
+            used += 1
         context = "\n\n".join(parts)
 
-        return f"""Based on the regulatory documents below, answer the question.
+        prompt = f"""Based on the regulatory documents below, answer the question.
 
 Context:
 {context}
@@ -138,11 +168,10 @@ Context:
 Question: {question}
 
 Provide a detailed answer based only on the information above. If you don't know, say so."""
+        return prompt, used
 
-    def _generate_answer(self, query: RAGQuery, context_chunks: List[Dict]) -> str:
+    def _generate_answer(self, query: RAGQuery, prompt: str) -> str:
         """Generate answer using LLM"""
-        prompt = self._build_prompt(query.question, context_chunks)
-
         if query.llm_provider == LLMProvider.OPENAI:
             response = openai.ChatCompletion.create(
                 model="gpt-4",

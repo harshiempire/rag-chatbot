@@ -6,11 +6,9 @@ generation using SentenceTransformers or OpenAI models.
 """
 
 import logging
-import os
 import uuid
 from typing import Dict, List
 
-import openai
 from sentence_transformers import SentenceTransformer
 
 try:
@@ -27,9 +25,10 @@ logger = logging.getLogger(__name__)
 
 # Global singleton cache for embedding models (avoids reloading on each request)
 _embedding_model_cache = {}
+DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 
-def get_cached_embedding_model(model_name: str = "all-MiniLM-L6-v2"):
+def get_cached_embedding_model(model_name: str = DEFAULT_EMBEDDING_MODEL):
     """Get cached embedding model (singleton pattern)"""
     global _embedding_model_cache
     if model_name not in _embedding_model_cache:
@@ -41,17 +40,20 @@ def get_cached_embedding_model(model_name: str = "all-MiniLM-L6-v2"):
 class VectorizationEngine:
     """Vectorize documents using embeddings"""
 
-    def __init__(self, embedding_model: str = "all-MiniLM-L6-v2"):
+    def __init__(self, embedding_model: str = DEFAULT_EMBEDDING_MODEL):
         self.embedding_model = embedding_model
 
-        if embedding_model == "all-MiniLM-L6-v2":
+        # Canonical embedding model for 384-dim pgvector schema.
+        if embedding_model != DEFAULT_EMBEDDING_MODEL:
+            raise ValueError(
+                f"Unsupported embedding model '{embedding_model}'. "
+                f"This deployment requires canonical '{DEFAULT_EMBEDDING_MODEL}' for vector(384)."
+            )
+
+        if embedding_model == DEFAULT_EMBEDDING_MODEL:
             # Use cached model instead of loading fresh
             self.model = get_cached_embedding_model(embedding_model)
             self.embedding_dim = 384
-        elif embedding_model.startswith("text-embedding"):
-            openai.api_key = os.getenv('OPENAI_API_KEY')
-            self.model = "openai"
-            self.embedding_dim = 1536
         else:
             raise ValueError(f"Unsupported embedding model: {embedding_model}")
 
@@ -79,15 +81,10 @@ class VectorizationEngine:
 
     def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings for text chunks"""
-        if self.model == "openai":
-            response = openai.Embedding.create(
-                model=self.embedding_model,
-                input=texts
-            )
-            return [item['embedding'] for item in response['data']]
-        else:
-            embeddings = self.model.encode(texts, batch_size=32, show_progress_bar=False)
-            return embeddings.tolist()
+        if not texts:
+            return []
+        embeddings = self.model.encode(texts, batch_size=32, show_progress_bar=False)
+        return embeddings.tolist()
 
     def vectorize_document(self, content: str, metadata: Dict, chunk_config: Dict) -> List[Dict]:
         """Vectorize entire document"""
@@ -176,3 +173,21 @@ class VectorizationEngine:
         logger.info(f"Vectorized regulation: {len(vector_chunks)} chunks "
                    f"(method: {'structure_aware' if use_structure_aware else 'fixed'})")
         return vector_chunks
+
+
+def is_regulatory_document(source_id: str = "", metadata: Dict = None) -> bool:
+    """Heuristic detector for eCFR/legal sources to select structure-aware chunking."""
+    metadata = metadata or {}
+
+    source = str(metadata.get("source", "")).lower()
+    source_type = str(metadata.get("type", "")).lower()
+    source_id_l = str(source_id or "").lower()
+    has_reg_fields = any(k in metadata for k in ["title", "chapter", "part", "section"])
+
+    return (
+        source == "ecfr"
+        or source_type in {"section", "regulation", "subpart"}
+        or "ecfr" in source_id_l
+        or "cfr" in source_id_l
+        or has_reg_fields
+    )

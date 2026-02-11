@@ -8,6 +8,7 @@ business logic to the appropriate engine/service classes.
 import json
 import logging
 import uuid
+import time
 from typing import Dict, List
 
 from fastapi import APIRouter, HTTPException
@@ -25,8 +26,12 @@ from app.core.schemas import (
 )
 from app.extraction.dynamic import DynamicExtractor
 from app.extraction.pii import PIIDetector
-from app.rag.engine import RAGEngine, MAX_TOP_K, MAX_CHUNK_CHARS, MAX_CONTEXT_CHARS
-from app.vectorization.engine import VectorizationEngine
+from app.rag.engine import RAGEngine, RAG_PROMPT_K, RAG_RETRIEVE_K
+from app.vectorization.engine import (
+    DEFAULT_EMBEDDING_MODEL,
+    VectorizationEngine,
+    is_regulatory_document,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +117,7 @@ async def extract_data(source_id: str):
 
         # Store as documents
         doc_ids = []
-        pii_detected = False
+        pending_review_count = 0
         for idx, row in df.iterrows():
             doc_id = str(uuid.uuid4())
             content = row.get('content', str(row.to_dict()))
@@ -121,6 +126,8 @@ async def extract_data(source_id: str):
             # PII detection
             pii_detected = _pii_detector.detect(content)
             status = DocumentStatus.PENDING_REVIEW.value if pii_detected else DocumentStatus.EXTRACTED.value
+            if pii_detected:
+                pending_review_count += 1
 
             vector_db.store_document(
                 doc_id, source_id, content, metadata,
@@ -131,7 +138,7 @@ async def extract_data(source_id: str):
         return {
             "message": f"Extracted {len(doc_ids)} documents",
             "document_ids": doc_ids,
-            "pending_review": sum(1 for _ in doc_ids if pii_detected)
+            "pending_review": pending_review_count
         }
 
     except Exception as e:
@@ -179,7 +186,7 @@ async def vectorize_document(
         cur = conn.cursor()
 
         cur.execute("""
-            SELECT content, metadata, classification
+            SELECT content, metadata, classification, source_id
             FROM documents WHERE id = %s AND status = 'approved'
         """, (document_id,))
 
@@ -188,16 +195,30 @@ async def vectorize_document(
             cur.close()
             raise HTTPException(status_code=404, detail="Approved document not found")
 
-        content, metadata_json, classification = row
+        content, metadata_json, classification, source_id = row
 
-        metadata = json.loads(metadata_json) if metadata_json else {}
+        metadata = metadata_json if isinstance(metadata_json, dict) else (json.loads(metadata_json) if metadata_json else {})
 
         # Vectorize
         vectorization = VectorizationEngine(vectorization_config.embedding_model.value)
-        vector_chunks = vectorization.vectorize_document(
-            content, metadata,
-            {'chunk_size': chunking_config.chunk_size, 'chunk_overlap': chunking_config.chunk_overlap}
+        strategy = vectorization_config.chunking_strategy.value
+        use_structure_aware = (
+            strategy == "structure_aware" or
+            (strategy == "auto" and is_regulatory_document(source_id=source_id, metadata=metadata))
         )
+        if use_structure_aware:
+            vector_chunks = vectorization.vectorize_regulation(
+                content,
+                metadata,
+                use_structure_aware=True,
+                max_chunk_size=chunking_config.chunk_size,
+                min_chunk_size=chunking_config.min_chunk_size,
+            )
+        else:
+            vector_chunks = vectorization.vectorize_document(
+                content, metadata,
+                {'chunk_size': chunking_config.chunk_size, 'chunk_overlap': chunking_config.chunk_overlap}
+            )
 
         # Store chunks
         for chunk in vector_chunks:
@@ -266,25 +287,36 @@ async def rag_query_stream_endpoint(query: RAGQuery, user_id: str = "user-123"):
     engine._validate_llm_access(query.llm_provider, classifications)
 
     if engine.vectorization is None:
-        engine.vectorization = VectorizationEngine()
-    query_embedding = engine.vectorization.generate_embeddings([query.question])[0]
+        engine.vectorization = VectorizationEngine(DEFAULT_EMBEDDING_MODEL)
+    embed_start = time.perf_counter()
+    query_embedding = engine.get_query_embedding(query.question)
+    embed_ms = round((time.perf_counter() - embed_start) * 1000, 2)
 
+    search_start = time.perf_counter()
     results = engine.vector_db.similarity_search(
         query_embedding,
         [c.value for c in classifications],
-        min(query.top_k, MAX_TOP_K),
+        min(max(query.top_k, 1), RAG_RETRIEVE_K),
         query.min_similarity
     )
+    search_ms = round((time.perf_counter() - search_start) * 1000, 2)
 
     if not results:
         raise HTTPException(status_code=404, detail="No relevant documents found")
 
     max_class = engine._get_max_classification([r["classification"] for r in results])
 
-    prompt = engine._build_prompt(query.question, results)
+    prompt, prompt_context_count = engine._build_prompt(query.question, results)
 
     engine.vector_db.log_query(
-        user_id, query.question, query.llm_provider.value, max_class.value, True
+        user_id, query.question, query.llm_provider.value, max_class.value, True,
+        details={
+            "retrieved_count": len(results),
+            "prompt_context_count": prompt_context_count,
+            "timings_ms": {"embed": embed_ms, "search": search_ms},
+            "prompt_k": RAG_PROMPT_K,
+            "retrieve_k": RAG_RETRIEVE_K,
+        }
     )
 
     return StreamingResponse(engine._ollama_stream(prompt), media_type="text/plain")

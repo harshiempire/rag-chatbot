@@ -55,3 +55,9 @@ class EmbeddingModel(str, Enum):
     OPENAI_ADA_002 = "text-embedding-ada-002"
     OPENAI_3_SMALL = "text-embedding-3-small"
     SENTENCE_TRANSFORMERS = "all-MiniLM-L6-v2"
+
+
+class ChunkingStrategy(str, Enum):
+    AUTO = "auto"
+    FIXED = "fixed"
+    STRUCTURE_AWARE = "structure_aware"

@@ -76,6 +76,8 @@ OPENAI_API_KEY=sk-your-openai-key
 ANTHROPIC_API_KEY=sk-ant-your-anthropic-key
 GEMINI_API_KEY=your-gemini-key
 OPENROUTER_API_KEY=your-openrouter-key
+RAG_RETRIEVE_K=8
+RAG_PROMPT_K=3
 ```
 
 ---
@@ -144,10 +146,12 @@ curl -X POST "http://localhost:8000/api/v1/rag/query" \
     "question": "What are the capital requirements for banks under 12 CFR?",
     "llm_provider": "openrouter",
     "classification_filter": ["public"],
-    "top_k": 3,
+    "top_k": 8,
     "temperature": 0.7
   }'
 ```
+
+`top_k` controls retrieval upper-bound (capped by `RAG_RETRIEVE_K`), while prompt context is capped by `RAG_PROMPT_K`.
 
 ---
 
