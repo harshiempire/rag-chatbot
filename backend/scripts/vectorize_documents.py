@@ -1,6 +1,11 @@
 import argparse
 import json
 import os
+import sys
+from pathlib import Path
+
+# Allow running this script directly via `python scripts/vectorize_documents.py`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import psycopg2
 from dotenv import load_dotenv

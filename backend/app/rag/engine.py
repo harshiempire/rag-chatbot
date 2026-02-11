@@ -298,3 +298,86 @@ Provide a detailed answer based only on the information above. If you don't know
             yield f"\n\n[Error] Cannot connect to Ollama at {local_url}. Ensure `ollama serve` is running.\n"
         except Exception as e:
             yield f"\n\n[Error] Local LLM streaming error: {str(e)}\n"
+
+    def _openrouter_stream(self, prompt: str, temperature: float = 0.7, max_tokens: int = 2048):
+        """Stream response from OpenRouter (OpenAI-compatible SSE)."""
+        openrouter_key = os.getenv("OPENROUTER_API_KEY")
+        if not openrouter_key:
+            yield "\n\n[Error] OPENROUTER_API_KEY not configured.\n"
+            return
+
+        openrouter_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-r1-0528:free")
+        timeout = float(os.getenv("OPENROUTER_STREAM_TIMEOUT", "300"))
+
+        try:
+            with requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openrouter_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "http://localhost:8000",
+                    "X-Title": "RAG-Chatbot",
+                },
+                json={
+                    "model": openrouter_model,
+                    "messages": [
+                        {"role": "system", "content": "You are a regulatory compliance expert."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stream": True,
+                },
+                stream=True,
+                timeout=timeout,
+            ) as resp:
+                resp.raise_for_status()
+
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+
+                    line = line.strip()
+                    # OpenRouter may send SSE comment keep-alives like ": OPENROUTER PROCESSING"
+                    if line.startswith(":"):
+                        continue
+
+                    payload = line[len("data:"):].strip() if line.startswith("data:") else line
+                    if not payload or payload == "[DONE]":
+                        if payload == "[DONE]":
+                            break
+                        continue
+
+                    try:
+                        data = json.loads(payload)
+                    except Exception:
+                        continue
+
+                    error = data.get("error")
+                    if error:
+                        message = error.get("message") if isinstance(error, dict) else str(error)
+                        yield f"\n\n[Error] OpenRouter stream error: {message}\n"
+                        break
+
+                    choices = data.get("choices") or []
+                    if not choices:
+                        continue
+
+                    choice = choices[0] or {}
+                    delta = choice.get("delta") or {}
+                    token = delta.get("content", "")
+                    if token:
+                        yield token
+
+                    if choice.get("finish_reason") == "error":
+                        yield "\n\n[Error] OpenRouter stream terminated with finish_reason=error.\n"
+                        break
+        except requests.exceptions.Timeout:
+            yield "\n\n[Error] OpenRouter timeout while streaming.\n"
+        except requests.exceptions.ConnectionError:
+            yield "\n\n[Error] Cannot connect to OpenRouter.\n"
+        except requests.exceptions.HTTPError as e:
+            detail = e.response.text if e.response is not None else str(e)
+            yield f"\n\n[Error] OpenRouter HTTP error: {detail}\n"
+        except Exception as e:
+            yield f"\n\n[Error] OpenRouter streaming error: {str(e)}\n"

@@ -1,0 +1,21 @@
+services:
+  rag-postgres:
+    image: ankane/pgvector:latest
+    container_name: rag-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: rag_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - rag_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rag_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  rag_postgres_data:

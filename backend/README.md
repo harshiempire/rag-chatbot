@@ -153,6 +153,24 @@ curl -X POST "http://localhost:8000/api/v1/rag/query" \
 
 `top_k` controls retrieval upper-bound (capped by `RAG_RETRIEVE_K`), while prompt context is capped by `RAG_PROMPT_K`.
 
+### Structured Streaming (for frontend timelines)
+
+```bash
+curl -N -X POST "http://localhost:8000/api/v1/rag/query/stream/events" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "Summarize key points from 12 CFR Chapter 12",
+    "llm_provider": "local",
+    "classification_filter": ["public"],
+    "top_k": 5,
+    "temperature": 0.7,
+    "min_similarity": 0.2
+  }'
+```
+
+This endpoint emits `text/event-stream` with event envelopes:
+`{"type":"status|token|source|final|error|done","data":{...}}`.
+
 ---
 
 ## 🧪 Running Tests
