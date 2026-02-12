@@ -196,13 +196,7 @@ class RAGEngine:
                 continue
 
             metadata = self._extract_source_metadata(chunk)
-            section_key_parts = [
-                str(metadata.get("chapter") or ""),
-                str(metadata.get("part") or ""),
-                str(metadata.get("section") or metadata.get("heading") or ""),
-            ]
-            if any(section_key_parts):
-                section_keys.add("|".join(section_key_parts))
+            # section_keys.add logic moved to after capacity check
 
             metadata_items = []
             for field in [
@@ -231,10 +225,24 @@ class RAGEngine:
                 if remaining > 200:
                     parts.append(block[:remaining])
                     used += 1
+                    section_key_parts = [
+                        str(metadata.get("chapter") or ""),
+                        str(metadata.get("part") or ""),
+                        str(metadata.get("section") or metadata.get("heading") or ""),
+                    ]
+                    if any(section_key_parts):
+                        section_keys.add("|".join(section_key_parts))
                 break
             parts.append(block)
             total += len(block)
             used += 1
+            section_key_parts = [
+                str(metadata.get("chapter") or ""),
+                str(metadata.get("part") or ""),
+                str(metadata.get("section") or metadata.get("heading") or ""),
+            ]
+            if any(section_key_parts):
+                section_keys.add("|".join(section_key_parts))
         context = "\n\n".join(parts)
 
         coverage_note = ""
