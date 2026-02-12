@@ -1,103 +1,98 @@
-# RAG-Enabled ETL Platform
-> Secure data extraction, vectorization, and Retrieval-Augmented Generation with enterprise controls.
+# RAG-Chatbot (Backend + Frontend)
 
----
+Full-stack RAG chat application with:
+- `backend/`: FastAPI + PostgreSQL/pgvector + multi-provider RAG engine
+- `frontend/`: React + Vite chat UI using structured SSE streaming
 
-## 📁 Project Structure
+## Repository Layout
 
-```
+```text
 RAG-Chatbot/
-├── app/
-│   ├── main.py                  # FastAPI entry point
-│   ├── config.py                # Environment config
-│   ├── core/
-│   │   ├── enums.py             # All enumerations
-│   │   ├── schemas.py           # Pydantic models
-│   │   ├── secrets.py           # SecretManager (AES-256)
-│   │   └── database.py          # PostgreSQL + pgvector
-│   ├── extraction/
-│   │   ├── ecfr.py              # eCFR API extractor
-│   │   ├── dynamic.py           # Multi-source extractor
-│   │   └── pii.py               # PII detection
-│   ├── vectorization/
-│   │   ├── chunker.py           # Structure-aware chunking
-│   │   └── engine.py            # Embedding generation
-│   ├── rag/
-│   │   └── engine.py            # RAG query engine (multi-LLM)
-│   └── api/
-│       └── routes.py            # All HTTP endpoints
-├── tests/                       # Test scripts
-├── scripts/                     # CLI utilities
-├── requirements.txt
-├── .env                         # Environment variables
-└── README.md
+├── backend/
+│   ├── app/                      # FastAPI app
+│   ├── scripts/                  # Ingestion/vectorization helpers
+│   ├── tests/                    # API smoke scripts
+│   ├── docker-compose.postgres.yml
+│   └── requirements.txt
+└── frontend/
+    ├── src/                      # React app
+    └── package.json
 ```
 
----
+## Prerequisites
 
-## 📦 Installation
+- Python 3.10+
+- Node.js 18+
+- Docker (for local PostgreSQL + pgvector)
 
-### 1. Clone & Create Virtual Environment
+## Quick Start
+
+1. Start PostgreSQL + pgvector.
 
 ```bash
-git clone <your-repo-url>
-cd RAG-Chatbot
+docker compose -f backend/docker-compose.postgres.yml up -d
+```
 
-# Create venv with uv
-uv venv
+2. Configure backend environment.
+
+Create `backend/.env`:
+
+```bash
+ENCRYPTION_KEY=your-fernet-key
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/rag_db
+
+# Optional provider keys
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+GEMINI_API_KEY=
+OPENROUTER_API_KEY=
+
+# Optional tuning
+RAG_RETRIEVE_K=8
+RAG_PROMPT_K=3
+RAG_MAX_CHUNK_CHARS=1200
+RAG_MAX_CONTEXT_CHARS=6000
+RAG_IVFFLAT_PROBES=10
+RAG_MIN_DISTINCT_SECTIONS=2
+OPENROUTER_MODEL=deepseek/deepseek-r1-0528:free
+LOCAL_LLM_URL=http://localhost:11434/api/generate
+LOCAL_LLM_MODEL=llama3.1:8b
+```
+
+3. Install and run backend.
+
+```bash
+cd backend
+python3 -m venv .venv
 source .venv/bin/activate
-```
-
-### 2. Install Dependencies
-
-```bash
-uv pip install -r requirements.txt
-```
-
-### 3. Setup PostgreSQL with pgvector
-
-```bash
-docker run -d \
-  --name rag-postgres \
-  -e POSTGRES_PASSWORD=yourpassword \
-  -e POSTGRES_DB=rag_db \
-  -p 5432:5432 \
-  ankane/pgvector
-```
-
-### 4. Configure Environment
-
-Create a `.env` file in the project root:
-
-```bash
-ENCRYPTION_KEY=your-fernet-key-here
-DATABASE_URL=postgresql://postgres:yourpassword@localhost:5432/rag_db
-OPENAI_API_KEY=sk-your-openai-key
-ANTHROPIC_API_KEY=sk-ant-your-anthropic-key
-GEMINI_API_KEY=your-gemini-key
-OPENROUTER_API_KEY=your-openrouter-key
-```
-
----
-
-## 🚀 Running the Application
-
-```bash
-# Activate venv
-source .venv/bin/activate
-
-# Start the server (from project root)
+pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
-
-# Access API docs
-open http://localhost:8000/docs
 ```
 
----
+4. Install and run frontend (new terminal).
 
-## 📚 Complete Workflow Example
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
-### Step 1: Create Data Source
+Frontend defaults to `http://localhost:8000/api/v1`.
+To override, create `frontend/.env.local`:
+
+```bash
+VITE_API_BASE_URL=http://localhost:8000/api/v1
+```
+
+## Verify Services
+
+- Backend health: `http://localhost:8000/health`
+- Backend docs: `http://localhost:8000/docs`
+- Frontend app: `http://localhost:5173`
+
+## Backend API Workflow
+
+1. Create a source.
 
 ```bash
 curl -X POST "http://localhost:8000/api/v1/sources/" \
@@ -113,29 +108,13 @@ curl -X POST "http://localhost:8000/api/v1/sources/" \
   }'
 ```
 
-### Step 2: Run Complete Workflow (Extract → Review → Vectorize → Publish)
+2. Run full pipeline (extract -> review/auto-approve -> vectorize -> publish).
 
 ```bash
 curl -X POST "http://localhost:8000/api/v1/workflow/complete?source_id=<SOURCE_ID>"
 ```
 
-### Step 3: Review Pending Documents
-
-```bash
-# Get pending reviews
-curl "http://localhost:8000/api/v1/documents/pending-review"
-
-# Approve a document
-curl -X POST "http://localhost:8000/api/v1/documents/<DOC_ID>/review" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "document_id": "<DOC_ID>",
-    "reviewer_id": "reviewer@company.com",
-    "decision": "approve"
-  }'
-```
-
-### Step 4: Query RAG System
+3. Query RAG (non-streaming).
 
 ```bash
 curl -X POST "http://localhost:8000/api/v1/rag/query" \
@@ -144,118 +123,77 @@ curl -X POST "http://localhost:8000/api/v1/rag/query" \
     "question": "What are the capital requirements for banks under 12 CFR?",
     "llm_provider": "openrouter",
     "classification_filter": ["public"],
-    "top_k": 3,
-    "temperature": 0.7
+    "source_id": "ecfr-title-12-chapter-xii",
+    "top_k": 8,
+    "temperature": 0.7,
+    "min_similarity": 0.2
   }'
 ```
 
----
-
-## 🧪 Running Tests
-
-Tests are standalone HTTP scripts that call the running API:
+4. Structured streaming endpoint used by frontend.
 
 ```bash
-# Make sure the server is running first, then in another terminal:
-source .venv/bin/activate
+curl -N -X POST "http://localhost:8000/api/v1/rag/query/stream/events" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "Summarize key points from 12 CFR Chapter 12",
+    "llm_provider": "local",
+    "classification_filter": ["public"],
+    "source_id": "ecfr-title-12-chapter-xii",
+    "top_k": 5,
+    "temperature": 0.7,
+    "min_similarity": 0.2
+  }'
+```
 
-python tests/test_query_openrouter.py
+Event format:
+
+```json
+{"type":"status|token|source|final|error|done","data":{}}
+```
+
+## Important Behavior
+
+- Frontend provider selector currently supports `local` and `openrouter`.
+- Streaming endpoints support `local` and `openrouter` only.
+- `confidential`/`restricted` classification can only be queried with `local` provider.
+- Chat history in frontend is stored in browser `localStorage` (key: `rag_chat_v1`).
+
+## Useful Backend Endpoints
+
+- `GET /health`
+- `GET /api/v1/stats`
+- `GET /api/v1/audit?limit=100`
+- `GET /api/v1/documents/pending-review`
+- `POST /api/v1/documents/{document_id}/review`
+- `POST /api/v1/documents/{document_id}/vectorize`
+- `POST /api/v1/documents/publish`
+
+## Scripts
+
+Run from `backend/` with backend virtual environment activated.
+
+Ingest eCFR chapter batches:
+
+```bash
+python scripts/ingest_ecfr_chapter.py --title 12 --chapter XII --date 2024-01-01 --batch-size 5 --batch-index 0
+```
+
+Vectorize existing documents for a source:
+
+```bash
+python scripts/vectorize_documents.py --source-id <SOURCE_ID> --chunking-strategy auto --replace-existing
+```
+
+## Smoke Tests
+
+Run from `backend/` while API is running:
+
+```bash
 python tests/test_query_local.py
+python tests/test_query_openrouter.py
 python tests/test_query_openai.py
 python tests/test_query_gemini.py
-python tests/test_chunking_comparison.py
 ```
 
----
-
-## 🔐 Security Features
-
-| Feature | Description |
-|---------|-------------|
-| **Data Classification** | `public`, `internal`, `confidential`, `restricted` levels |
-| **LLM Access Control** | Restricted/confidential data can **only** use local LLMs |
-| **Secret Encryption** | All API keys & passwords encrypted with AES-256 (Fernet) |
-| **PII Detection** | Auto-detects emails, SSNs, phone/credit card numbers |
-| **Audit Trail** | Every RAG query logged with user, provider, and classification |
-
----
-
-## 🏗️ Architecture
-
-```
-┌─────────────┐
-│   eCFR API  │ ──┐
-│  (Title 12) │   │
-└─────────────┘   │
-                  │
-┌─────────────┐   │    ┌──────────────┐
-│  REST APIs  │ ──┼───▶│  Extractors  │
-│ (OAuth2)    │   │    └──────┬───────┘
-└─────────────┘   │           │
-                  │           ▼
-┌─────────────┐   │    ┌──────────────┐
-│ Databases   │ ──┘    │ PII Detector │
-└─────────────┘        └──────┬───────┘
-                              │
-                              ▼
-                       ┌──────────────┐
-                       │    Review    │
-                       │   Workflow   │
-                       └──────┬───────┘
-                              │
-                              ▼
-                       ┌──────────────┐
-                       │ Vectorization│
-                       │  (Embeddings)│
-                       └──────┬───────┘
-                              │
-                              ▼
-                       ┌──────────────┐
-                       │  PostgreSQL  │
-                       │  + pgvector  │
-                       └──────┬───────┘
-                              │
-                              ▼
-┌─────────────┐        ┌──────────────┐
-│   OpenAI    │◀───────│  RAG Engine  │
-│  Anthropic  │        │  (Security)  │
-│   Gemini    │        └──────┬───────┘
-│ OpenRouter  │               │
-│  Local LLM  │               ▼
-└─────────────┘        ┌──────────────┐
-                       │  Audit Log   │
-                       └──────────────┘
-```
-
----
-
-## 🎯 Key Benefits
-
-- **Multi-LLM Support** — OpenAI, Anthropic, Google Gemini, OpenRouter, Local (Ollama)
-- **Enterprise Compliance** — Review workflow with data classification enforcement
-- **Secret Security** — All credentials encrypted at rest with AES-256
-- **Vector Search** — Fast semantic similarity via PostgreSQL + pgvector
-- **Streaming** — Real-time streaming for local LLM responses
-- **Complete Audit** — Every query logged for compliance
-
----
-
-## 🔄 Maintenance
-
-```bash
-# Backup database
-pg_dump rag_db > backup.sql
-
-# Check stats
-curl "http://localhost:8000/api/v1/stats"
-
-# View audit log
-curl "http://localhost:8000/api/v1/audit?limit=100"
-
-# Health check
-curl "http://localhost:8000/health"
-```
-
----
-
-**Start extracting regulations and querying with AI!** 🚀
+Note: `tests/test_chunking_comparison.py` is currently out of date and not part of the runnable smoke suite.
