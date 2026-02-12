@@ -253,7 +253,6 @@ class RAGEngine:
                 f"- Retrieved context spans only {distinct_sections} distinct section(s).\n"
                 "- Provide a partial answer, explicitly state coverage is limited, and avoid chapter-wide claims.\n"
             )
-            # TODO: need to look at the prompt afterwards
         prompt = f"""Based on the regulatory documents below, answer the question.
 
 Context:
