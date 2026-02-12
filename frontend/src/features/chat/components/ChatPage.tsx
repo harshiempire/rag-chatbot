@@ -1,5 +1,5 @@
+
 import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import clsx from 'clsx';
 import type {
   ChatEvent,
   ChatMessage,
@@ -15,9 +15,15 @@ import { useChatSessionsQuery } from '../hooks/useChatSessionsQuery';
 import { useSaveSessionMutation } from '../hooks/useSaveSessionMutation';
 import { useSendMessageMutation } from '../hooks/useSendMessageMutation';
 import { useDeleteSessionMutation } from '../hooks/useDeleteSessionMutation';
-import { MessageComposer } from './MessageComposer';
-import { MessageList } from './MessageList';
 import { RAG_DEFAULT_SOURCE_ID, RAG_DEFAULT_TOP_K } from '../../../shared/api/config';
+
+import { Sidebar } from './layout/Sidebar';
+import { ChatArea } from './chat/ChatArea';
+import { ChatInput } from './chat/ChatInput';
+import { Menu } from 'lucide-react';
+import { Button } from './ui/Button';
+
+// --- Reducer & State Definitions ---
 
 interface ChatState {
   session: ChatSession | null;
@@ -80,10 +86,19 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
       if (!state.session) return state;
       return {
         ...state,
-        session: updateAssistantMessage(state.session, action.messageId, (message) => ({
-          ...message,
-          statusHistory: [...(message.statusHistory ?? []), action.status],
-        })),
+        session: updateAssistantMessage(state.session, action.messageId, (message) => {
+          const history = message.statusHistory ?? [];
+          const lastStatus = history[history.length - 1];
+          // If the new status is for the same stage as the last one, update it instead of appending
+          // specific check: if last was 'start' and new is 'done' for same stage?
+          // actually generally if stages match, we likely want to update the entry with the latest state/label.
+          if (lastStatus && lastStatus.stage === action.status.stage) {
+            const newHistory = [...history];
+            newHistory[history.length - 1] = action.status;
+            return { ...message, statusHistory: newHistory };
+          }
+          return { ...message, statusHistory: [...history, action.status] };
+        }),
       };
     }
     case 'add_source': {
@@ -130,10 +145,28 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
       if (!state.session) return state;
       return {
         streamingMessageId: null,
-        session: updateAssistantMessage(state.session, action.messageId, (message) => ({
-          ...message,
-          done: true,
-        })),
+        session: updateAssistantMessage(state.session, action.messageId, (message) => {
+          // Force the last status to be done if it exists, to ensure loader is removed
+          let newHistory = message.statusHistory;
+          if (newHistory && newHistory.length > 0) {
+            const lastIdx = newHistory.length - 1;
+            const lastStatus = newHistory[lastIdx];
+            if (lastStatus.state !== 'done') {
+              newHistory = [...newHistory];
+              newHistory[lastIdx] = {
+                ...lastStatus,
+                state: 'done',
+                // Update label to indicate completion if we are forcing it closed
+                label: lastStatus.label === 'Generating answer' ? 'Answer generated' : lastStatus.label
+              };
+            }
+          }
+          return {
+            ...message,
+            done: true,
+            statusHistory: newHistory
+          };
+        }),
       };
     }
     default:
@@ -157,58 +190,16 @@ function formatError(error: unknown, fallback: string): string {
   return error instanceof Error && error.message ? error.message : fallback;
 }
 
-function formatSessionTime(timestamp: number): string {
-  const date = new Date(timestamp);
-  const now = new Date();
-  const isToday = date.toDateString() === now.toDateString();
-
-  if (isToday) {
-    return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-  }
-
-  return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
-}
-
-function getSessionPreview(session: ChatSession): string {
-  const latestMessage = [...session.messages].reverse().find((message) => message.content.trim());
-  if (!latestMessage) {
-    return 'No messages yet';
-  }
-
-  return latestMessage.content.slice(0, 86).trim();
-}
-
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError';
-}
-
-function getPipelineStatusLabel(state: ChatState): string {
-  if (!state.streamingMessageId || !state.session) {
-    return 'Ready';
-  }
-
-  const activeMessage = state.session.messages.find((message) => message.id === state.streamingMessageId);
-  if (!activeMessage) {
-    return 'Generating response...';
-  }
-
-  const latestStatus = activeMessage.statusHistory?.at(-1);
-  if (!latestStatus) {
-    return 'Retrieving context...';
-  }
-
-  if (latestStatus.state === 'done') {
-    return `${latestStatus.label} complete`;
-  }
-
-  return latestStatus.label;
 }
 
 export function ChatPage() {
   const sessionsQuery = useChatSessionsQuery();
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [provider, setProvider] = useState<LLMProvider>('local');
-  const [composerError, setComposerError] = useState<string | null>(null);
+  const [_composerError, setComposerError] = useState<string | null>(null);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
   const sessionQuery = useChatSessionQuery(selectedSessionId);
   const saveSessionMutation = useSaveSessionMutation();
@@ -253,15 +244,14 @@ export function ChatPage() {
     return [local, ...fromQuery].sort((a, b) => b.updatedAt - a.updatedAt);
   }, [sessionsQuery.data, state.session]);
 
-  const pipelineStatusLabel = useMemo(() => getPipelineStatusLabel(state), [state]);
-  const selectedSession = state.session ?? sessions.find((session) => session.id === selectedSessionId) ?? null;
   const isStreaming = Boolean(state.streamingMessageId) || sendMessageMutation.isPending;
 
   const persistSession = async (session: ChatSession) => {
     try {
       await saveSessionMutation.mutateAsync(session);
     } catch (error) {
-      setComposerError(formatError(error, 'Unable to save this chat locally.'));
+      console.error("Failed to save session", error);
+      setComposerError("Failed to save session");
     }
   };
 
@@ -442,125 +432,81 @@ export function ChatPage() {
         }
       }
     } catch (error) {
+      console.error("Failed to delete session", error);
       setComposerError(formatError(error, 'Unable to delete this chat.'));
     }
   };
 
-  const loadingSession = Boolean(selectedSessionId) && sessionQuery.isLoading && !state.streamingMessageId;
-  const sessionsLoading = sessionsQuery.isLoading && !sessionsQuery.data;
-
   return (
-    <div className="chat-shell">
-      <aside className="chat-sidebar">
-        <div className="chat-sidebar__brand">
-          <p className="chat-sidebar__eyebrow">Assistant</p>
-          <h1>RAG Studio</h1>
-          <p className="chat-sidebar__subtitle">Grounded answers with citations and live pipeline traces.</p>
-        </div>
+    <div className="flex h-screen bg-slate-950 text-slate-200 font-sans overflow-hidden">
+      {isSidebarOpen && (
+        <div
+          className="fixed inset-0 bg-black/50 z-40 md:hidden"
+          onClick={() => setIsSidebarOpen(false)}
+        />
+      )}
 
-        <button type="button" className="new-chat-btn" onClick={onNewChat}>
-          + New chat
-        </button>
+      <div className={`fixed inset-y-0 left-0 z-50 transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:relative md:translate-x-0 transition duration-200 ease-in-out`}>
+        <Sidebar
+          sessions={sessions}
+          selectedSessionId={selectedSessionId}
+          onSelectSession={(id) => {
+            setSelectedSessionId(id);
+            setIsSidebarOpen(false);
+          }}
+          onDeleteSession={onDeleteSession}
+          onNewChat={() => {
+            onNewChat();
+            setIsSidebarOpen(false);
+          }}
+          isLoading={sessionsQuery.isLoading}
+        />
+      </div>
 
-        {sessionsLoading ? (
-          <div className="sidebar-feedback">Loading conversations...</div>
-        ) : null}
-
-        {sessionsQuery.isError ? (
-          <div className="sidebar-feedback sidebar-feedback--error">
-            <p>{formatError(sessionsQuery.error, 'Unable to load saved sessions.')}</p>
-            <button type="button" onClick={() => void sessionsQuery.refetch()}>
-              Retry
-            </button>
-          </div>
-        ) : null}
-
-        {!sessionsLoading && !sessionsQuery.isError && sessions.length === 0 ? (
-          <div className="sidebar-feedback">No saved chats yet. Start your first conversation.</div>
-        ) : null}
-
-        <div className="session-list" role="list" aria-label="Saved chat sessions">
-          {sessions.map((session) => (
-            <article
-              key={session.id}
-              className={clsx('session-item', selectedSessionId === session.id && 'session-item--active')}
-              role="listitem"
+      <div className="flex-1 flex flex-col min-w-0 relative">
+        <header className="flex items-center justify-between p-4 border-b border-slate-800 bg-slate-950/80 backdrop-blur-md sticky top-0 z-30">
+          <div className="flex items-center gap-3">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="md:hidden"
+              onClick={() => setIsSidebarOpen(true)}
             >
-              <button
-                type="button"
-                className="session-item__button"
-                onClick={() => {
-                  setSelectedSessionId(session.id);
-                  setComposerError(null);
-                }}
-              >
-                <span className="session-item__title">{session.title}</span>
-                <span className="session-item__preview">{getSessionPreview(session)}</span>
-                <span className="session-item__time">{formatSessionTime(session.updatedAt)}</span>
-              </button>
-              <button
-                type="button"
-                className="session-item__delete"
-                onClick={() => void onDeleteSession(session.id)}
-                disabled={deleteSessionMutation.isPending}
-                aria-label={`Delete ${session.title}`}
-              >
-                Delete
-              </button>
-            </article>
-          ))}
-        </div>
-      </aside>
-
-      <main className="chat-workspace">
-        <header className="chat-workspace__header">
-          <div>
-            <h2>{selectedSession?.title ?? 'New conversation'}</h2>
-            <p>{(selectedSession?.messages.length ?? 0) / 2} turns in this chat</p>
-          </div>
-          <div className="chat-workspace__status">
-            <span className={clsx('pipeline-pill', isStreaming ? 'pipeline-pill--live' : 'pipeline-pill--idle')}>
-              {pipelineStatusLabel}
-            </span>
+              <Menu className="h-5 w-5" />
+            </Button>
+            <div className="flex flex-col">
+              <span className="font-semibold text-lg text-slate-100">{state.session?.title || "New Chat"}</span>
+              <div className="flex items-center gap-2 mt-1">
+                <select
+                  value={provider}
+                  onChange={(e) => setProvider(e.target.value as LLMProvider)}
+                  className="bg-slate-900/50 border border-slate-800 text-xs text-slate-400 rounded-md px-2 py-1 outline-none focus:border-slate-600 focus:text-slate-200 transition-colors cursor-pointer"
+                >
+                  <option value="local">Local Model</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="anthropic">Anthropic</option>
+                  <option value="google">Google Gemini</option>
+                  <option value="openrouter">OpenRouter</option>
+                </select>
+              </div>
+            </div>
           </div>
         </header>
 
-        <section className="chat-workspace__body" aria-live="polite">
-          {loadingSession ? <div className="workspace-feedback">Loading conversation...</div> : null}
+        <ChatArea
+          messages={state.session?.messages ?? []}
+          isStreaming={isStreaming}
+          streamingMessageId={state.streamingMessageId}
+        />
 
-          {sessionQuery.isError && !state.session ? (
-            <div className="workspace-feedback workspace-feedback--error">
-              <p>{formatError(sessionQuery.error, 'Unable to load the selected conversation.')}</p>
-              <button type="button" onClick={() => void sessionQuery.refetch()}>
-                Retry
-              </button>
-            </div>
-          ) : null}
-
-          {!loadingSession && !sessionQuery.isError ? (
-            <MessageList messages={state.session?.messages ?? []} streamingMessageId={state.streamingMessageId} />
-          ) : null}
-        </section>
-
-        <footer className="chat-workspace__composer">
-          {composerError ? (
-            <div className="composer-error" role="alert">
-              <span>{composerError}</span>
-              <button type="button" onClick={() => setComposerError(null)}>
-                Dismiss
-              </button>
-            </div>
-          ) : null}
-
-          <MessageComposer
-            provider={provider}
-            onProviderChange={setProvider}
+        <div className="p-4 bg-gradient-to-t from-slate-950 to-transparent">
+          <ChatInput
             onSend={onSend}
-            onCancel={onCancel}
-            isStreaming={isStreaming}
+            onStop={onCancel}
+            isLoading={isStreaming}
           />
-        </footer>
-      </main>
+        </div>
+      </div>
     </div>
   );
 }

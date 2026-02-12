@@ -7,7 +7,7 @@ const statusEventSchema = z.object({
     stage: z.enum(['embedding', 'retrieval', 'prompt_build', 'generation']),
     state: z.enum(['start', 'done']),
     label: z.string(),
-    meta: z.record(z.unknown()).optional(),
+    meta: z.any().optional(),
   }),
 });
 
