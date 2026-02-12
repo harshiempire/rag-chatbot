@@ -7,8 +7,9 @@ vector similarity search, and audit logging.
 
 import json
 import logging
+import os
 from contextlib import contextmanager
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import psycopg2
@@ -151,10 +152,18 @@ class VectorDatabase:
             cur.close()
 
     def similarity_search(self, query_embedding: List[float],
-                         classifications: List[str], top_k: int = 5, min_similarity: float = 0.7):
+                         classifications: List[str], top_k: int = 5, min_similarity: float = 0.7,
+                         source_id: Optional[str] = None):
         """Perform vector similarity search"""
         with self.get_connection() as conn:
             cur = conn.cursor()
+
+            probes_raw = os.getenv("RAG_IVFFLAT_PROBES", "10")
+            try:
+                probes = max(int(probes_raw), 1)
+                cur.execute(f"SET LOCAL ivfflat.probes = {probes}")
+            except ValueError:
+                logger.warning(f"Invalid RAG_IVFFLAT_PROBES='{probes_raw}', using PostgreSQL default.")
 
             cur.execute("""
                 SELECT 
@@ -162,18 +171,22 @@ class VectorDatabase:
                     vc.content,
                     vc.metadata,
                     d.metadata as doc_metadata,
+                    d.source_id,
                     vc.classification,
                     1 - (vc.embedding <=> %s::vector) as similarity
                 FROM vector_chunks vc
                 JOIN documents d ON vc.document_id = d.id
                 WHERE vc.classification = ANY(%s)
                   AND d.status = 'published'
+                  AND (%s IS NULL OR d.source_id = %s)
                   AND 1 - (vc.embedding <=> %s::vector) >= %s
                 ORDER BY vc.embedding <=> %s::vector
                 LIMIT %s
             """, (
                 np.array(query_embedding),
                 classifications,
+                source_id,
+                source_id,
                 np.array(query_embedding),
                 min_similarity,
                 np.array(query_embedding),
@@ -187,8 +200,9 @@ class VectorDatabase:
                     'content': row[1],
                     'chunk_metadata': row[2] if isinstance(row[2], dict) else (json.loads(row[2]) if row[2] else {}),
                     'doc_metadata': row[3] if isinstance(row[3], dict) else (json.loads(row[3]) if row[3] else {}),
-                    'classification': row[4],
-                    'similarity': float(row[5])
+                    'source_id': row[4],
+                    'classification': row[5],
+                    'similarity': float(row[6])
                 })
 
             cur.close()

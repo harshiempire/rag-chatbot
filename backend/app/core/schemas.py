@@ -117,6 +117,7 @@ class RAGQuery(BaseModel):
     question: str
     llm_provider: LLMProvider
     classification_filter: Optional[List[DataClassification]] = None
+    source_id: Optional[str] = None
     top_k: int = 5
     temperature: float = 0.7
     min_similarity: float = 0.2

@@ -6,6 +6,13 @@ interface ChatHistoryEnvelope {
   sessions: Record<string, ChatSession>;
 }
 
+export class ChatHistoryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ChatHistoryError';
+  }
+}
+
 export interface ChatHistoryStore {
   listSessions(): Promise<ChatSession[]>;
   getSession(sessionId: string): Promise<ChatSession | null>;
@@ -15,7 +22,7 @@ export interface ChatHistoryStore {
 
 export class LocalStorageHistoryStore implements ChatHistoryStore {
   private readEnvelope(): ChatHistoryEnvelope {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = this.readStorage(STORAGE_KEY);
     if (!raw) {
       return { sessions: {} };
     }
@@ -24,12 +31,41 @@ export class LocalStorageHistoryStore implements ChatHistoryStore {
       const parsed = JSON.parse(raw) as ChatHistoryEnvelope;
       return parsed?.sessions ? parsed : { sessions: {} };
     } catch {
+      // Recover from malformed local data without crashing the UI.
       return { sessions: {} };
     }
   }
 
   private writeEnvelope(envelope: ChatHistoryEnvelope): void {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(envelope));
+    this.writeStorage(STORAGE_KEY, JSON.stringify(envelope));
+  }
+
+  private readStorage(key: string): string | null {
+    if (typeof localStorage === 'undefined') {
+      throw new ChatHistoryError('Local storage is unavailable in this environment.');
+    }
+
+    try {
+      return localStorage.getItem(key);
+    } catch (error) {
+      throw new ChatHistoryError(
+        `Unable to read local chat history: ${error instanceof Error ? error.message : 'unknown error'}`
+      );
+    }
+  }
+
+  private writeStorage(key: string, value: string): void {
+    if (typeof localStorage === 'undefined') {
+      throw new ChatHistoryError('Local storage is unavailable in this environment.');
+    }
+
+    try {
+      localStorage.setItem(key, value);
+    } catch (error) {
+      throw new ChatHistoryError(
+        `Unable to save chat history locally: ${error instanceof Error ? error.message : 'unknown error'}`
+      );
+    }
   }
 
   async listSessions(): Promise<ChatSession[]> {

@@ -52,6 +52,8 @@ RAG_RETRIEVE_K=8
 RAG_PROMPT_K=3
 RAG_MAX_CHUNK_CHARS=1200
 RAG_MAX_CONTEXT_CHARS=6000
+RAG_IVFFLAT_PROBES=10
+RAG_MIN_DISTINCT_SECTIONS=2
 OPENROUTER_MODEL=deepseek/deepseek-r1-0528:free
 LOCAL_LLM_URL=http://localhost:11434/api/generate
 LOCAL_LLM_MODEL=llama3.1:8b
@@ -121,6 +123,7 @@ curl -X POST "http://localhost:8000/api/v1/rag/query" \
     "question": "What are the capital requirements for banks under 12 CFR?",
     "llm_provider": "openrouter",
     "classification_filter": ["public"],
+    "source_id": "ecfr-title-12-chapter-xii",
     "top_k": 8,
     "temperature": 0.7,
     "min_similarity": 0.2
@@ -136,6 +139,7 @@ curl -N -X POST "http://localhost:8000/api/v1/rag/query/stream/events" \
     "question": "Summarize key points from 12 CFR Chapter 12",
     "llm_provider": "local",
     "classification_filter": ["public"],
+    "source_id": "ecfr-title-12-chapter-xii",
     "top_k": 5,
     "temperature": 0.7,
     "min_similarity": 0.2

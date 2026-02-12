@@ -30,6 +30,7 @@ RAG_RETRIEVE_K = int(os.getenv("RAG_RETRIEVE_K", "8"))
 RAG_PROMPT_K = int(os.getenv("RAG_PROMPT_K", "3"))
 MAX_CHUNK_CHARS = int(os.getenv("RAG_MAX_CHUNK_CHARS", "1200"))
 MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "6000"))
+RAG_MIN_DISTINCT_SECTIONS = int(os.getenv("RAG_MIN_DISTINCT_SECTIONS", "2"))
 
 
 class RAGEngine:
@@ -70,7 +71,8 @@ class RAGEngine:
             query_embedding,
             [c.value for c in classifications],
             retrieval_k,
-            rag_query.min_similarity
+            rag_query.min_similarity,
+            source_id=rag_query.source_id,
         )
         timings_ms["search"] = round((time.perf_counter() - search_start) * 1000, 2)
 
@@ -97,6 +99,7 @@ class RAGEngine:
             details={
                 "retrieved_count": len(results),
                 "prompt_context_count": prompt_context_count,
+                "source_id": rag_query.source_id,
                 "timings_ms": timings_ms,
             }
         )
@@ -138,18 +141,64 @@ class RAGEngine:
             self.vectorization = VectorizationEngine(DEFAULT_EMBEDDING_MODEL)
         return self.vectorization.generate_embeddings([question])[0]
 
+    @staticmethod
+    def _pick_metadata_value(chunk_metadata: Dict, doc_metadata: Dict, *keys):
+        for key in keys:
+            chunk_val = chunk_metadata.get(key)
+            if chunk_val not in (None, ""):
+                return chunk_val
+            doc_val = doc_metadata.get(key)
+            if doc_val not in (None, ""):
+                return doc_val
+        return None
+
+    def _extract_source_metadata(self, chunk: Dict) -> Dict:
+        chunk_metadata = chunk.get("chunk_metadata") or {}
+        doc_metadata = chunk.get("doc_metadata") or {}
+        return {
+            "source_id": chunk.get("source_id"),
+            "source": self._pick_metadata_value(chunk_metadata, doc_metadata, "source"),
+            "title": self._pick_metadata_value(chunk_metadata, doc_metadata, "title"),
+            "chapter": self._pick_metadata_value(chunk_metadata, doc_metadata, "chapter"),
+            "part": self._pick_metadata_value(chunk_metadata, doc_metadata, "part"),
+            "section": self._pick_metadata_value(chunk_metadata, doc_metadata, "section"),
+            "heading": self._pick_metadata_value(chunk_metadata, doc_metadata, "heading", "section_header"),
+            "similarity": chunk.get("similarity"),
+        }
+
     def _build_prompt(self, question: str, context_chunks: List[Dict]) -> tuple[str, int]:
         """Build the RAG prompt from context chunks"""
         chunks = context_chunks[:min(len(context_chunks), RAG_PROMPT_K)]
         parts = []
+        section_keys = set()
         total = 0
         used = 0
         for i, chunk in enumerate(chunks):
             text = (chunk.get("content") or "").strip()
             if not text:
                 continue
+
+            metadata = self._extract_source_metadata(chunk)
+            section_key_parts = [
+                str(metadata.get("chapter") or ""),
+                str(metadata.get("part") or ""),
+                str(metadata.get("section") or metadata.get("heading") or ""),
+            ]
+            if any(section_key_parts):
+                section_keys.add("|".join(section_key_parts))
+
+            metadata_items = []
+            for field in ["source_id", "title", "chapter", "part", "section", "heading", "source"]:
+                value = metadata.get(field)
+                if value not in (None, ""):
+                    metadata_items.append(f"{field}={value}")
+            similarity = metadata.get("similarity")
+            if isinstance(similarity, (float, int)):
+                metadata_items.append(f"similarity={float(similarity):.3f}")
+
             text = text[:MAX_CHUNK_CHARS]
-            block = f"[Source {i+1}]\n{text}"
+            metadata_line = "; ".join(metadata_items) if metadata_items else "metadata=none"
+            block = f"[Source {i+1}]\nMetadata: {metadata_line}\n{text}"
             if total + len(block) > MAX_CONTEXT_CHARS:
                 remaining = max(0, MAX_CONTEXT_CHARS - total)
                 if remaining > 200:
@@ -160,10 +209,20 @@ class RAGEngine:
             used += 1
         context = "\n\n".join(parts)
 
+        coverage_note = ""
+        distinct_sections = len(section_keys)
+        if used > 0 and distinct_sections < RAG_MIN_DISTINCT_SECTIONS:
+            coverage_note = (
+                "\nCoverage Note:\n"
+                f"- Retrieved context spans only {distinct_sections} distinct section(s).\n"
+                "- Provide a partial answer, explicitly state coverage is limited, and avoid chapter-wide claims.\n"
+            )
+
         prompt = f"""Based on the regulatory documents below, answer the question.
 
 Context:
 {context}
+{coverage_note}
 
 Question: {question}
 

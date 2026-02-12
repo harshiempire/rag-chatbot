@@ -59,11 +59,13 @@ def _build_source_event(result: Dict[str, Any], index: int) -> Dict[str, Any]:
     """Convert similarity-search result row into a frontend-friendly source payload."""
     chunk_metadata = result.get("chunk_metadata", {}) or {}
     doc_metadata = result.get("doc_metadata", {}) or {}
+    source_id = result.get("source_id")
 
     title = (
         doc_metadata.get("title")
         or chunk_metadata.get("section")
         or chunk_metadata.get("heading")
+        or source_id
         or f"Source {index}"
     )
     snippet = (result.get("content") or "").strip().replace("\n", " ")
@@ -76,6 +78,7 @@ def _build_source_event(result: Dict[str, Any], index: int) -> Dict[str, Any]:
         "snippet": snippet,
         "score": float(result.get("similarity", 0.0)),
         "metadata": {
+            "source_id": source_id,
             "classification": result.get("classification"),
             "chunk_metadata": chunk_metadata,
             "doc_metadata": doc_metadata,
@@ -334,7 +337,8 @@ async def rag_query_stream_endpoint(query: RAGQuery, user_id: str = "user-123"):
         query_embedding,
         [c.value for c in classifications],
         min(max(query.top_k, 1), RAG_RETRIEVE_K),
-        query.min_similarity
+        query.min_similarity,
+        source_id=query.source_id,
     )
     search_ms = round((time.perf_counter() - search_start) * 1000, 2)
 
@@ -350,6 +354,7 @@ async def rag_query_stream_endpoint(query: RAGQuery, user_id: str = "user-123"):
         details={
             "retrieved_count": len(results),
             "prompt_context_count": prompt_context_count,
+            "source_id": query.source_id,
             "timings_ms": {"embed": embed_ms, "search": search_ms},
             "prompt_k": RAG_PROMPT_K,
             "retrieve_k": RAG_RETRIEVE_K,
@@ -417,7 +422,11 @@ async def rag_query_stream_events_endpoint(query: RAGQuery, user_id: str = "user
                     "stage": "retrieval",
                     "state": "start",
                     "label": "Searching vector index",
-                    "meta": {"retrieve_k": retrieval_k, "min_similarity": query.min_similarity},
+                    "meta": {
+                        "retrieve_k": retrieval_k,
+                        "min_similarity": query.min_similarity,
+                        "source_id": query.source_id,
+                    },
                 },
             )
             search_start = time.perf_counter()
@@ -426,6 +435,7 @@ async def rag_query_stream_events_endpoint(query: RAGQuery, user_id: str = "user
                 [c.value for c in classifications],
                 retrieval_k,
                 query.min_similarity,
+                source_id=query.source_id,
             )
             search_ms = round((time.perf_counter() - search_start) * 1000, 2)
             timings_ms["search"] = search_ms
@@ -531,6 +541,7 @@ async def rag_query_stream_events_endpoint(query: RAGQuery, user_id: str = "user
                 details={
                     "retrieved_count": len(results),
                     "prompt_context_count": prompt_context_count,
+                    "source_id": query.source_id,
                     "timings_ms": timings_ms,
                     "prompt_k": RAG_PROMPT_K,
                     "retrieve_k": RAG_RETRIEVE_K,

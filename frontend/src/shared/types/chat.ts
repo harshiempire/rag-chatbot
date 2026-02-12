@@ -20,6 +20,12 @@ export interface ChatSource {
   metadata?: Record<string, unknown>;
 }
 
+export interface ChatUsage {
+  timingsMs?: Record<string, number>;
+  retrievedCount?: number;
+  promptContextCount?: number;
+}
+
 export interface StatusEvent {
   type: 'status';
   data: {
@@ -71,6 +77,7 @@ export interface RAGStreamRequest {
   question: string;
   llm_provider: LLMProvider;
   classification_filter: DataClassification[];
+  source_id?: string;
   top_k: number;
   temperature: number;
   min_similarity: number;
@@ -85,7 +92,7 @@ export interface ChatMessage {
   error?: string;
   sources?: ChatSource[];
   statusHistory?: PipelineStatusItem[];
-  usage?: Record<string, unknown>;
+  usage?: ChatUsage;
 }
 
 export interface ChatSession {
