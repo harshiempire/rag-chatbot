@@ -11,17 +11,38 @@ import uuid
 import time
 from typing import Dict, List, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
 
+from app.config import (
+    AUTH_COOKIE_SAMESITE,
+    AUTH_COOKIE_SECURE,
+    REFRESH_COOKIE_NAME,
+    REFRESH_TOKEN_EXPIRE_DAYS,
+)
+from app.core.auth import (
+    AuthError,
+    create_access_token,
+    decode_access_token,
+    hash_password,
+    hash_refresh_token,
+    issue_refresh_token,
+    normalize_email,
+    verify_password,
+)
 from app.core.database import VectorDatabase
 from app.core.enums import DataClassification, DocumentStatus, LLMProvider
 from app.core.schemas import (
+    AuthMessageResponse,
+    AuthTokenResponse,
     ChunkingConfig,
     DataSourceDefinition,
     RAGQuery,
     RAGResponse,
     ReviewDecision,
+    UserLoginRequest,
+    UserPublic,
+    UserSignupRequest,
     VectorizationConfig,
 )
 from app.extraction.dynamic import DynamicExtractor
@@ -105,6 +126,152 @@ def get_rag_engine() -> RAGEngine:
     if _rag_engine is None:
         _rag_engine = RAGEngine(get_vector_db())
     return _rag_engine
+
+
+def _build_user_public(user: Dict[str, Any]) -> UserPublic:
+    return UserPublic(
+        id=str(user["id"]),
+        email=user["email"],
+        created_at=user["created_at"],
+    )
+
+
+def _set_refresh_cookie(response: Response, refresh_token: str) -> None:
+    response.set_cookie(
+        key=REFRESH_COOKIE_NAME,
+        value=refresh_token,
+        httponly=True,
+        secure=AUTH_COOKIE_SECURE,
+        samesite=AUTH_COOKIE_SAMESITE,
+        max_age=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+        path="/",
+    )
+
+
+def _clear_refresh_cookie(response: Response) -> None:
+    response.delete_cookie(key=REFRESH_COOKIE_NAME, path="/")
+
+
+def _extract_bearer_token(authorization: str | None) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing authorization header.")
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
+        raise HTTPException(status_code=401, detail="Invalid authorization header.")
+    return parts[1]
+
+
+def get_current_user(
+    authorization: str | None = Header(default=None),
+    vector_db: VectorDatabase = Depends(get_vector_db),
+) -> Dict[str, Any]:
+    token = _extract_bearer_token(authorization)
+    try:
+        payload = decode_access_token(token)
+    except AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    user = vector_db.get_user_by_id(payload["sub"])
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found.")
+    return user
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+@router.post("/auth/signup", response_model=AuthMessageResponse, status_code=201)
+async def signup(payload: UserSignupRequest):
+    """Create an email+password user account."""
+    vector_db = get_vector_db()
+    created_user = vector_db.create_user(
+        email=normalize_email(payload.email),
+        password_hash=hash_password(payload.password),
+    )
+    if not created_user:
+        raise HTTPException(status_code=409, detail="Email is already registered.")
+    return AuthMessageResponse(message="Account created successfully. Please log in.")
+
+
+@router.post("/auth/login", response_model=AuthTokenResponse)
+async def login(payload: UserLoginRequest, response: Response):
+    """Authenticate a user and return access token + refresh cookie."""
+    vector_db = get_vector_db()
+    user = vector_db.get_user_by_email(normalize_email(payload.email))
+    if not user or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    access_token, expires_in = create_access_token(user_id=str(user["id"]), email=user["email"])
+    refresh_token, refresh_token_hash, refresh_expires_at = issue_refresh_token()
+    vector_db.create_refresh_token(
+        user_id=str(user["id"]),
+        token_hash=refresh_token_hash,
+        expires_at=refresh_expires_at,
+    )
+    _set_refresh_cookie(response, refresh_token)
+
+    return AuthTokenResponse(
+        access_token=access_token,
+        expires_in=expires_in,
+        user=_build_user_public(user),
+    )
+
+
+@router.post("/auth/refresh", response_model=AuthTokenResponse)
+async def refresh_access_token(
+    response: Response,
+    refresh_token: str | None = Cookie(default=None, alias=REFRESH_COOKIE_NAME),
+):
+    """Rotate refresh token and return a fresh access token."""
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="Refresh token is missing.")
+
+    vector_db = get_vector_db()
+    refresh_token_hash = hash_refresh_token(refresh_token)
+    refresh_record = vector_db.get_valid_refresh_token(refresh_token_hash)
+    if not refresh_record:
+        _clear_refresh_cookie(response)
+        raise HTTPException(status_code=401, detail="Refresh token is invalid or expired.")
+
+    user = refresh_record["user"]
+    new_refresh_token, new_refresh_hash, new_refresh_expires_at = issue_refresh_token()
+    try:
+        vector_db.rotate_refresh_token(
+            old_token_hash=refresh_token_hash,
+            new_token_hash=new_refresh_hash,
+            expires_at=new_refresh_expires_at,
+        )
+    except ValueError as exc:
+        _clear_refresh_cookie(response)
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    access_token, expires_in = create_access_token(user_id=str(user["id"]), email=user["email"])
+    _set_refresh_cookie(response, new_refresh_token)
+
+    return AuthTokenResponse(
+        access_token=access_token,
+        expires_in=expires_in,
+        user=_build_user_public(user),
+    )
+
+
+@router.post("/auth/logout", response_model=AuthMessageResponse)
+async def logout(
+    response: Response,
+    refresh_token: str | None = Cookie(default=None, alias=REFRESH_COOKIE_NAME),
+):
+    """Invalidate refresh token cookie and server-side token record."""
+    if refresh_token:
+        get_vector_db().revoke_refresh_token(hash_refresh_token(refresh_token))
+    _clear_refresh_cookie(response)
+    return AuthMessageResponse(message="Logged out successfully.")
+
+
+@router.get("/auth/me", response_model=UserPublic)
+async def get_me(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Get the currently authenticated user."""
+    return _build_user_public(current_user)
 
 
 # ---------------------------------------------------------------------------
@@ -298,8 +465,12 @@ async def publish_documents(document_ids: List[str]):
 # ---------------------------------------------------------------------------
 
 @router.post("/rag/query", response_model=RAGResponse)
-async def rag_query_endpoint(query: RAGQuery, user_id: str = "user-123"):
+async def rag_query_endpoint(
+    query: RAGQuery,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """Query RAG system with security controls"""
+    user_id = str(current_user["id"])
     try:
         response = get_rag_engine().query(query, user_id)
         logger.info(f"✅ RAG query by {user_id}: {query.question[:50]}...")
@@ -313,8 +484,12 @@ async def rag_query_endpoint(query: RAGQuery, user_id: str = "user-123"):
 
 
 @router.post("/rag/query/stream")
-async def rag_query_stream_endpoint(query: RAGQuery, user_id: str = "user-123"):
+async def rag_query_stream_endpoint(
+    query: RAGQuery,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """Streaming RAG response (text/plain) for LOCAL and OPENROUTER providers."""
+    user_id = str(current_user["id"])
     if query.llm_provider not in {LLMProvider.LOCAL, LLMProvider.OPENROUTER}:
         raise HTTPException(
             status_code=400,
@@ -370,7 +545,10 @@ async def rag_query_stream_endpoint(query: RAGQuery, user_id: str = "user-123"):
 
 
 @router.post("/rag/query/stream/events")
-async def rag_query_stream_events_endpoint(query: RAGQuery, user_id: str = "user-123"):
+async def rag_query_stream_events_endpoint(
+    query: RAGQuery,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """
     Structured SSE streaming endpoint for frontend timeline/status rendering.
     Event envelope:
@@ -383,6 +561,7 @@ async def rag_query_stream_events_endpoint(query: RAGQuery, user_id: str = "user
         )
 
     engine = get_rag_engine()
+    user_id = str(current_user["id"])
     classifications = query.classification_filter or [DataClassification.PUBLIC]
     engine._validate_llm_access(query.llm_provider, classifications)
 

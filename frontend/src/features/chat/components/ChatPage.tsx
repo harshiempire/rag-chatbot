@@ -16,6 +16,7 @@ import { useSaveSessionMutation } from '../hooks/useSaveSessionMutation';
 import { useSendMessageMutation } from '../hooks/useSendMessageMutation';
 import { useDeleteSessionMutation } from '../hooks/useDeleteSessionMutation';
 import { RAG_DEFAULT_SOURCE_ID, RAG_DEFAULT_TOP_K } from '../../../shared/api/config';
+import { useAuth } from '../../auth/context/AuthContext';
 
 import { Sidebar } from './layout/Sidebar';
 import { ChatArea } from './chat/ChatArea';
@@ -195,16 +196,18 @@ function isAbortError(error: unknown): boolean {
 }
 
 export function ChatPage() {
-  const sessionsQuery = useChatSessionsQuery();
+  const { user, logout } = useAuth();
+  const userId = user?.id ?? '';
+  const sessionsQuery = useChatSessionsQuery(userId);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [provider, setProvider] = useState<LLMProvider>('local');
   const [_composerError, setComposerError] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
-  const sessionQuery = useChatSessionQuery(selectedSessionId);
-  const saveSessionMutation = useSaveSessionMutation();
+  const sessionQuery = useChatSessionQuery(userId, selectedSessionId);
+  const saveSessionMutation = useSaveSessionMutation(userId);
   const sendMessageMutation = useSendMessageMutation();
-  const deleteSessionMutation = useDeleteSessionMutation();
+  const deleteSessionMutation = useDeleteSessionMutation(userId);
 
   const [state, dispatch] = useReducer(chatReducer, initialState);
   const stateRef = useRef(state);
@@ -437,6 +440,10 @@ export function ChatPage() {
     }
   };
 
+  if (!user) {
+    return null;
+  }
+
   return (
     <div className="flex h-screen bg-slate-950 text-slate-200 font-sans overflow-hidden">
       {isSidebarOpen && (
@@ -450,6 +457,10 @@ export function ChatPage() {
         <Sidebar
           sessions={sessions}
           selectedSessionId={selectedSessionId}
+          userEmail={user.email}
+          onLogout={() => {
+            void logout();
+          }}
           onSelectSession={(id) => {
             setSelectedSessionId(id);
             setIsSidebarOpen(false);

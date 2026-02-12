@@ -9,6 +9,7 @@ import json
 import logging
 import os
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -56,6 +57,7 @@ class VectorDatabase:
 
             # Enable pgvector extension
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
 
             # Documents table
             cur.execute("""
@@ -112,11 +114,37 @@ class VectorDatabase:
                 )
             """)
 
+            # Users table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    email VARCHAR(255) NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+
+            # Refresh tokens table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS refresh_tokens (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    token_hash VARCHAR(128) NOT NULL UNIQUE,
+                    expires_at TIMESTAMP NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    revoked_at TIMESTAMP
+                )
+            """)
+
             # Create indexes
             cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_classification ON documents(classification)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_vector_chunks_doc ON vector_chunks(document_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires_at ON refresh_tokens(expires_at)")
 
             conn.commit()
             cur.close()
@@ -302,3 +330,168 @@ class VectorDatabase:
                 'total_vector_chunks': total_chunks,
                 'query_statistics': query_stats
             }
+
+    # ---------------------------------------------------------------------
+    # Authentication helpers
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _map_user_row(row: Any) -> Dict[str, Any]:
+        return {
+            "id": str(row[0]),
+            "email": row[1],
+            "password_hash": row[2],
+            "created_at": row[3],
+            "updated_at": row[4],
+        }
+
+    def create_user(self, email: str, password_hash: str) -> Optional[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO users (email, password_hash)
+                    VALUES (%s, %s)
+                    RETURNING id, email, password_hash, created_at, updated_at
+                    """,
+                    (email, password_hash),
+                )
+                row = cur.fetchone()
+                conn.commit()
+                cur.close()
+                return self._map_user_row(row)
+            except psycopg2.Error as exc:
+                conn.rollback()
+                cur.close()
+                if exc.pgcode == "23505":
+                    return None
+                raise
+
+    def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, email, password_hash, created_at, updated_at
+                FROM users
+                WHERE email = %s
+                LIMIT 1
+                """,
+                (email,),
+            )
+            row = cur.fetchone()
+            cur.close()
+            return self._map_user_row(row) if row else None
+
+    def get_user_by_id(self, user_id: str) -> Optional[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, email, password_hash, created_at, updated_at
+                FROM users
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+            cur.close()
+            return self._map_user_row(row) if row else None
+
+    def create_refresh_token(self, user_id: str, token_hash: str, expires_at: datetime) -> None:
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
+                VALUES (%s, %s, %s)
+                """,
+                (user_id, token_hash, expires_at),
+            )
+            conn.commit()
+            cur.close()
+
+    def get_valid_refresh_token(self, token_hash: str) -> Optional[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT
+                    rt.id,
+                    rt.user_id,
+                    rt.token_hash,
+                    rt.expires_at,
+                    rt.created_at,
+                    u.id,
+                    u.email,
+                    u.password_hash,
+                    u.created_at,
+                    u.updated_at
+                FROM refresh_tokens rt
+                JOIN users u ON u.id = rt.user_id
+                WHERE rt.token_hash = %s
+                  AND rt.revoked_at IS NULL
+                  AND rt.expires_at > NOW()
+                LIMIT 1
+                """,
+                (token_hash,),
+            )
+            row = cur.fetchone()
+            cur.close()
+            if not row:
+                return None
+            return {
+                "id": str(row[0]),
+                "user_id": str(row[1]),
+                "token_hash": row[2],
+                "expires_at": row[3],
+                "created_at": row[4],
+                "user": self._map_user_row((row[5], row[6], row[7], row[8], row[9])),
+            }
+
+    def rotate_refresh_token(self, old_token_hash: str, new_token_hash: str, expires_at: datetime) -> None:
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE refresh_tokens
+                SET revoked_at = NOW()
+                WHERE token_hash = %s
+                  AND revoked_at IS NULL
+                RETURNING user_id
+                """,
+                (old_token_hash,),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                cur.close()
+                raise ValueError("Refresh token is invalid or already rotated.")
+
+            user_id = row[0]
+            cur.execute(
+                """
+                INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
+                VALUES (%s, %s, %s)
+                """,
+                (user_id, new_token_hash, expires_at),
+            )
+            conn.commit()
+            cur.close()
+
+    def revoke_refresh_token(self, token_hash: str) -> None:
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE refresh_tokens
+                SET revoked_at = NOW()
+                WHERE token_hash = %s
+                  AND revoked_at IS NULL
+                """,
+                (token_hash,),
+            )
+            conn.commit()
+            cur.close()

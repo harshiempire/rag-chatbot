@@ -1,6 +1,7 @@
 import { API_BASE_URL } from './config';
 import { parseSSEJson } from './sse';
 import { parseChatEvent } from './chatEventSchema';
+import { authorizedFetch } from './httpClient';
 import type { ChatEvent, RAGStreamRequest } from '../types/chat';
 
 export interface ChatTransport {
@@ -9,7 +10,7 @@ export interface ChatTransport {
 
 export class SseChatTransport implements ChatTransport {
   async *sendMessage(payload: RAGStreamRequest, signal?: AbortSignal): AsyncGenerator<ChatEvent> {
-    const response = await fetch(`${API_BASE_URL}/rag/query/stream/events`, {
+    const response = await authorizedFetch(`${API_BASE_URL}/rag/query/stream/events`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
