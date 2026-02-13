@@ -70,7 +70,8 @@ _pii_detector = PIIDetector()
 # In-memory storage (replace with DB in production)
 data_sources: Dict[str, DataSourceDefinition] = {}
 CHAT_HISTORY_MAX_TURNS = 12
-CHAT_HISTORY_MAX_CHARS_PER_TURN = 1000
+CHAT_HISTORY_MAX_CHARS_PER_TURN = 600
+CHAT_HISTORY_MAX_TOTAL_CHARS = 2800
 
 
 def _sse_event(event_type: str, data: Dict[str, Any]) -> str:
@@ -219,10 +220,27 @@ def _question_with_conversation_context(question: str, history: List[Dict[str, s
     if not history:
         return question
 
-    lines = []
-    for message in history:
+    lines_reversed: List[str] = []
+    consumed_chars = 0
+    for message in reversed(history):
         prefix = "User" if message["role"] == "user" else "Assistant"
-        lines.append(f"{prefix}: {message['content']}")
+        line = f"{prefix}: {message['content']}"
+        next_size = len(line) + (1 if lines_reversed else 0)
+        remaining = CHAT_HISTORY_MAX_TOTAL_CHARS - consumed_chars
+        if remaining <= 0:
+            break
+        if next_size > remaining:
+            if remaining > 64:
+                line = f"{line[: max(0, remaining - 4)].rstrip()}..."
+                lines_reversed.append(line)
+                consumed_chars = CHAT_HISTORY_MAX_TOTAL_CHARS
+            break
+        lines_reversed.append(line)
+        consumed_chars += next_size
+
+    lines = list(reversed(lines_reversed))
+    if len(lines) < len(history):
+        lines.insert(0, "[Earlier turns omitted due to prompt budget]")
 
     history_block = "\n".join(lines)
     return (

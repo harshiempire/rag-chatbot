@@ -30,6 +30,9 @@ RAG_RETRIEVE_K = int(os.getenv("RAG_RETRIEVE_K", "8"))
 RAG_PROMPT_K = int(os.getenv("RAG_PROMPT_K", "3"))
 MAX_CHUNK_CHARS = int(os.getenv("RAG_MAX_CHUNK_CHARS", "1200"))
 MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "6000"))
+MAX_PROMPT_CHARS = int(os.getenv("RAG_MAX_PROMPT_CHARS", "10000"))
+MAX_QUESTION_CHARS = int(os.getenv("RAG_MAX_QUESTION_CHARS", "2200"))
+PROMPT_SCAFFOLD_CHARS = int(os.getenv("RAG_PROMPT_SCAFFOLD_CHARS", "900"))
 RAG_MIN_DISTINCT_SECTIONS = int(os.getenv("RAG_MIN_DISTINCT_SECTIONS", "2"))
 
 
@@ -188,6 +191,15 @@ class RAGEngine:
         self, question: str, context_chunks: List[Dict]
     ) -> tuple[str, int]:
         """Build the RAG prompt from context chunks"""
+        question_text = (question or "").strip()
+        if len(question_text) > MAX_QUESTION_CHARS:
+            question_text = f"{question_text[: MAX_QUESTION_CHARS - 3].rstrip()}..."
+
+        context_budget = min(
+            MAX_CONTEXT_CHARS,
+            max(1200, MAX_PROMPT_CHARS - len(question_text) - PROMPT_SCAFFOLD_CHARS),
+        )
+
         chunks = context_chunks[: min(len(context_chunks), RAG_PROMPT_K)]
         parts = []
         section_keys = set()
@@ -223,8 +235,8 @@ class RAGEngine:
                 "; ".join(metadata_items) if metadata_items else "metadata=none"
             )
             block = f"[Source {i + 1}]\nMetadata: {metadata_line}\n{text}"
-            if total + len(block) > MAX_CONTEXT_CHARS:
-                remaining = max(0, MAX_CONTEXT_CHARS - total)
+            if total + len(block) > context_budget:
+                remaining = max(0, context_budget - total)
                 if remaining > 200:
                     parts.append(block[:remaining])
                     used += 1
@@ -262,7 +274,22 @@ Context:
 {context}
 {coverage_note}
 
-Question: {question}
+Question: {question_text}
+
+Provide a detailed answer based only on the information above. If you don't know, say so."""
+
+        if len(prompt) > MAX_PROMPT_CHARS:
+            overflow = len(prompt) - MAX_PROMPT_CHARS
+            trimmed_context = context[: max(0, len(context) - overflow)].rstrip()
+            if trimmed_context and len(trimmed_context) < len(context):
+                trimmed_context = f"{trimmed_context}\n...[context truncated for prompt budget]"
+            prompt = f"""Based on the regulatory documents below, answer the question.
+
+Context:
+{trimmed_context}
+{coverage_note}
+
+Question: {question_text}
 
 Provide a detailed answer based only on the information above. If you don't know, say so."""
         return prompt, used
