@@ -7,9 +7,10 @@ business logic to the appropriate engine/service classes.
 
 import json
 import logging
-import uuid
+import os
 import time
-from typing import Dict, List, Any
+import uuid
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -36,6 +37,7 @@ from app.core.schemas import (
     AuthMessageResponse,
     AuthTokenResponse,
     ChatSessionPayload,
+    ChatSessionSummaryPayload,
     ChunkingConfig,
     DataSourceDefinition,
     RAGQuery,
@@ -50,9 +52,9 @@ from app.extraction.dynamic import DynamicExtractor
 from app.extraction.pii import PIIDetector
 from app.rag.engine import (
     MAX_QUESTION_CHARS,
-    RAGEngine,
     RAG_PROMPT_K,
     RAG_RETRIEVE_K,
+    RAGEngine,
 )
 from app.vectorization.engine import (
     DEFAULT_EMBEDDING_MODEL,
@@ -77,11 +79,20 @@ data_sources: Dict[str, DataSourceDefinition] = {}
 CHAT_HISTORY_MAX_TURNS = 12
 CHAT_HISTORY_MAX_CHARS_PER_TURN = 600
 CHAT_HISTORY_MAX_TOTAL_CHARS = 2800
+CHAT_SESSION_MAX_MESSAGES = int(os.getenv("CHAT_SESSION_MAX_MESSAGES", "200"))
+CHAT_SESSION_MAX_MESSAGE_CONTENT_CHARS = int(
+    os.getenv("CHAT_SESSION_MAX_MESSAGE_CONTENT_CHARS", "8000")
+)
+CHAT_SESSION_MAX_PAYLOAD_BYTES = int(
+    os.getenv("CHAT_SESSION_MAX_PAYLOAD_BYTES", "1048576")
+)
 
 
 def _sse_event(event_type: str, data: Dict[str, Any]) -> str:
     """Serialize a structured SSE event envelope."""
-    payload = json.dumps({"type": event_type, "data": data}, default=str, ensure_ascii=False)
+    payload = json.dumps(
+        {"type": event_type, "data": data}, default=str, ensure_ascii=False
+    )
     return f"data: {payload}\n\n"
 
 
@@ -126,7 +137,9 @@ def init_services(db_url: str):
 def get_vector_db() -> VectorDatabase:
     global _vector_db
     if _vector_db is None:
-        raise RuntimeError("VectorDatabase not initialized. Call init_services() first.")
+        raise RuntimeError(
+            "VectorDatabase not initialized. Call init_services() first."
+        )
     return _vector_db
 
 
@@ -186,7 +199,9 @@ def get_current_user(
     return user
 
 
-def _normalize_chat_history(messages: List[Dict[str, Any]] | None) -> List[Dict[str, str]]:
+def _normalize_chat_history(
+    messages: List[Dict[str, Any]] | None,
+) -> List[Dict[str, str]]:
     normalized: List[Dict[str, str]] = []
     for item in messages or []:
         if not isinstance(item, dict):
@@ -207,7 +222,9 @@ def _normalize_chat_history(messages: List[Dict[str, Any]] | None) -> List[Dict[
     return normalized[-CHAT_HISTORY_MAX_TURNS:]
 
 
-def _resolve_history_for_query(query: RAGQuery, current_user: Dict[str, Any]) -> List[Dict[str, str]]:
+def _resolve_history_for_query(
+    query: RAGQuery, current_user: Dict[str, Any]
+) -> List[Dict[str, str]]:
     history = _normalize_chat_history(query.chat_history)
     if history:
         return history
@@ -215,13 +232,61 @@ def _resolve_history_for_query(query: RAGQuery, current_user: Dict[str, Any]) ->
     if not query.session_id:
         return []
 
-    session = get_vector_db().get_chat_session(str(current_user["id"]), query.session_id)
+    session = get_vector_db().get_chat_session(
+        str(current_user["id"]), query.session_id
+    )
     if not session:
         return []
     return _normalize_chat_history(session.get("messages", []))
 
 
-def _question_with_conversation_context(question: str, history: List[Dict[str, str]]) -> str:
+def _enforce_chat_session_limits(payload: ChatSessionPayload) -> None:
+    messages = payload.messages or []
+    if len(messages) > CHAT_SESSION_MAX_MESSAGES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Session has {len(messages)} messages; "
+                f"maximum allowed is {CHAT_SESSION_MAX_MESSAGES}."
+            ),
+        )
+
+    for idx, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if (
+            isinstance(content, str)
+            and len(content) > CHAT_SESSION_MAX_MESSAGE_CONTENT_CHARS
+        ):
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Message at index {idx} has content length {len(content)}; "
+                    f"maximum allowed is {CHAT_SESSION_MAX_MESSAGE_CONTENT_CHARS}."
+                ),
+            )
+
+    payload_size_bytes = len(
+        json.dumps(
+            payload.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    if payload_size_bytes > CHAT_SESSION_MAX_PAYLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Session payload size is {payload_size_bytes} bytes; "
+                f"maximum allowed is {CHAT_SESSION_MAX_PAYLOAD_BYTES} bytes."
+            ),
+        )
+
+
+def _question_with_conversation_context(
+    question: str, history: List[Dict[str, str]]
+) -> str:
     if not history:
         return question
 
@@ -275,21 +340,19 @@ def _question_with_conversation_context(question: str, history: List[Dict[str, s
         if len("\n".join(candidate_lines)) <= history_budget:
             lines = candidate_lines
 
-
     history_block = "\n".join(lines).strip()
     if not history_block:
         return question_text
 
     return (
-        f"{preamble}\n\n"
-        f"{history_header}{history_block}"
-        f"{question_header}{question_text}"
+        f"{preamble}\n\n{history_header}{history_block}{question_header}{question_text}"
     )
 
 
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
+
 
 @router.post("/auth/signup", response_model=AuthMessageResponse, status_code=201)
 async def signup(payload: UserSignupRequest):
@@ -312,7 +375,9 @@ async def login(payload: UserLoginRequest, response: Response):
     if not user or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-    access_token, expires_in = create_access_token(user_id=str(user["id"]), email=user["email"])
+    access_token, expires_in = create_access_token(
+        user_id=str(user["id"]), email=user["email"]
+    )
     refresh_token, refresh_token_hash, refresh_expires_at = issue_refresh_token()
     vector_db.create_refresh_token(
         user_id=str(user["id"]),
@@ -342,7 +407,9 @@ async def refresh_access_token(
     refresh_record = vector_db.get_valid_refresh_token(refresh_token_hash)
     if not refresh_record:
         _clear_refresh_cookie(response)
-        raise HTTPException(status_code=401, detail="Refresh token is invalid or expired.")
+        raise HTTPException(
+            status_code=401, detail="Refresh token is invalid or expired."
+        )
 
     user = refresh_record["user"]
     new_refresh_token, new_refresh_hash, new_refresh_expires_at = issue_refresh_token()
@@ -356,7 +423,9 @@ async def refresh_access_token(
         _clear_refresh_cookie(response)
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
-    access_token, expires_in = create_access_token(user_id=str(user["id"]), email=user["email"])
+    access_token, expires_in = create_access_token(
+        user_id=str(user["id"]), email=user["email"]
+    )
     _set_refresh_cookie(response, new_refresh_token)
 
     return AuthTokenResponse(
@@ -388,14 +457,25 @@ async def get_me(current_user: Dict[str, Any] = Depends(get_current_user)):
 # Chat Sessions
 # ---------------------------------------------------------------------------
 
+
 @router.get("/chat/sessions", response_model=List[ChatSessionPayload])
 async def list_chat_sessions(current_user: Dict[str, Any] = Depends(get_current_user)):
     """List chat sessions for the authenticated user."""
     return get_vector_db().list_chat_sessions(str(current_user["id"]))
 
 
+@router.get("/chat/sessions/summary", response_model=List[ChatSessionSummaryPayload])
+async def list_chat_session_summaries(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """List chat session metadata for the authenticated user."""
+    return get_vector_db().list_chat_session_summaries(str(current_user["id"]))
+
+
 @router.get("/chat/sessions/{session_id}", response_model=ChatSessionPayload)
-async def get_chat_session(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+async def get_chat_session(
+    session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)
+):
     """Fetch a single chat session for the authenticated user."""
     session = get_vector_db().get_chat_session(str(current_user["id"]), session_id)
     if not session:
@@ -411,15 +491,22 @@ async def save_chat_session(
 ):
     """Create or update a chat session payload for the authenticated user."""
     if payload.id != session_id:
-        raise HTTPException(status_code=400, detail="Path session id must match payload id.")
+        raise HTTPException(
+            status_code=400, detail="Path session id must match payload id."
+        )
+    _enforce_chat_session_limits(payload)
     try:
-        return get_vector_db().save_chat_session(str(current_user["id"]), payload.dict())
+        return get_vector_db().save_chat_session(
+            str(current_user["id"]), payload.dict()
+        )
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 @router.delete("/chat/sessions/{session_id}", response_model=AuthMessageResponse)
-async def delete_chat_session(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+async def delete_chat_session(
+    session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)
+):
     """Delete a chat session for the authenticated user."""
     deleted = get_vector_db().delete_chat_session(str(current_user["id"]), session_id)
     if not deleted:
@@ -430,6 +517,7 @@ async def delete_chat_session(session_id: str, current_user: Dict[str, Any] = De
 # ---------------------------------------------------------------------------
 # Source Management
 # ---------------------------------------------------------------------------
+
 
 @router.post("/sources/", response_model=DataSourceDefinition)
 async def create_source(source: DataSourceDefinition):
@@ -458,6 +546,7 @@ async def get_source(source_id: str):
 # Extraction
 # ---------------------------------------------------------------------------
 
+
 @router.post("/extract/{source_id}")
 async def extract_data(source_id: str):
     """Extract data from source"""
@@ -477,25 +566,34 @@ async def extract_data(source_id: str):
         pending_review_count = 0
         for idx, row in df.iterrows():
             doc_id = str(uuid.uuid4())
-            content = row.get('content', str(row.to_dict()))
-            metadata = row.get('metadata', {}) if 'metadata' in row else {}
+            content = row.get("content", str(row.to_dict()))
+            metadata = row.get("metadata", {}) if "metadata" in row else {}
 
             # PII detection
             pii_detected = _pii_detector.detect(content)
-            status = DocumentStatus.PENDING_REVIEW.value if pii_detected else DocumentStatus.EXTRACTED.value
+            status = (
+                DocumentStatus.PENDING_REVIEW.value
+                if pii_detected
+                else DocumentStatus.EXTRACTED.value
+            )
             if pii_detected:
                 pending_review_count += 1
 
             vector_db.store_document(
-                doc_id, source_id, content, metadata,
-                source.classification.value, status, pii_detected
+                doc_id,
+                source_id,
+                content,
+                metadata,
+                source.classification.value,
+                status,
+                pii_detected,
             )
             doc_ids.append(doc_id)
 
         return {
             "message": f"Extracted {len(doc_ids)} documents",
             "document_ids": doc_ids,
-            "pending_review": pending_review_count
+            "pending_review": pending_review_count,
         }
 
     except Exception as e:
@@ -507,6 +605,7 @@ async def extract_data(source_id: str):
 # Document Review
 # ---------------------------------------------------------------------------
 
+
 @router.get("/documents/pending-review")
 async def get_pending_reviews():
     """Get documents pending review"""
@@ -517,12 +616,24 @@ async def get_pending_reviews():
 @router.post("/documents/{document_id}/review")
 async def review_document(document_id: str, decision: ReviewDecision):
     """Review and approve/reject document"""
-    status = DocumentStatus.APPROVED.value if decision.decision == "approve" else DocumentStatus.REJECTED.value
-    classification = decision.classification_override.value if decision.classification_override else None
+    status = (
+        DocumentStatus.APPROVED.value
+        if decision.decision == "approve"
+        else DocumentStatus.REJECTED.value
+    )
+    classification = (
+        decision.classification_override.value
+        if decision.classification_override
+        else None
+    )
 
-    get_vector_db().update_document_status(document_id, status, decision.reviewer_id, classification)
+    get_vector_db().update_document_status(
+        document_id, status, decision.reviewer_id, classification
+    )
 
-    logger.info(f"✅ Document {document_id} {decision.decision}ed by {decision.reviewer_id}")
+    logger.info(
+        f"✅ Document {document_id} {decision.decision}ed by {decision.reviewer_id}"
+    )
     return {"message": f"Document {decision.decision}ed", "document_id": document_id}
 
 
@@ -530,11 +641,12 @@ async def review_document(document_id: str, decision: ReviewDecision):
 # Vectorization
 # ---------------------------------------------------------------------------
 
+
 @router.post("/documents/{document_id}/vectorize")
 async def vectorize_document(
     document_id: str,
     chunking_config: ChunkingConfig = ChunkingConfig(),
-    vectorization_config: VectorizationConfig = VectorizationConfig()
+    vectorization_config: VectorizationConfig = VectorizationConfig(),
 ):
     """Vectorize approved document"""
     vector_db = get_vector_db()
@@ -542,10 +654,13 @@ async def vectorize_document(
     with vector_db.get_connection() as conn:
         cur = conn.cursor()
 
-        cur.execute("""
+        cur.execute(
+            """
             SELECT content, metadata, classification, source_id
             FROM documents WHERE id = %s AND status = 'approved'
-        """, (document_id,))
+        """,
+            (document_id,),
+        )
 
         row = cur.fetchone()
         if not row:
@@ -554,14 +669,18 @@ async def vectorize_document(
 
         content, metadata_json, classification, source_id = row
 
-        metadata = metadata_json if isinstance(metadata_json, dict) else (json.loads(metadata_json) if metadata_json else {})
+        metadata = (
+            metadata_json
+            if isinstance(metadata_json, dict)
+            else (json.loads(metadata_json) if metadata_json else {})
+        )
 
         # Vectorize
         vectorization = VectorizationEngine(vectorization_config.embedding_model.value)
         strategy = vectorization_config.chunking_strategy.value
-        use_structure_aware = (
-            strategy == "structure_aware" or
-            (strategy == "auto" and is_regulatory_document(source_id=source_id, metadata=metadata))
+        use_structure_aware = strategy == "structure_aware" or (
+            strategy == "auto"
+            and is_regulatory_document(source_id=source_id, metadata=metadata)
         )
         if use_structure_aware:
             vector_chunks = vectorization.vectorize_regulation(
@@ -573,24 +692,39 @@ async def vectorize_document(
             )
         else:
             vector_chunks = vectorization.vectorize_document(
-                content, metadata,
-                {'chunk_size': chunking_config.chunk_size, 'chunk_overlap': chunking_config.chunk_overlap}
+                content,
+                metadata,
+                {
+                    "chunk_size": chunking_config.chunk_size,
+                    "chunk_overlap": chunking_config.chunk_overlap,
+                },
             )
 
         # Store chunks
         for chunk in vector_chunks:
             vector_db.store_vector_chunk(
-                chunk['id'], document_id, chunk['content'], chunk['embedding'],
-                chunk['metadata'], chunk['chunk_index'], classification
+                chunk["id"],
+                document_id,
+                chunk["content"],
+                chunk["embedding"],
+                chunk["metadata"],
+                chunk["chunk_index"],
+                classification,
             )
 
         # Update status
-        cur.execute("UPDATE documents SET status = 'vectorized' WHERE id = %s", (document_id,))
+        cur.execute(
+            "UPDATE documents SET status = 'vectorized' WHERE id = %s", (document_id,)
+        )
         conn.commit()
         cur.close()
 
     logger.info(f"✅ Vectorized document {document_id}: {len(vector_chunks)} chunks")
-    return {"message": "Document vectorized", "document_id": document_id, "num_chunks": len(vector_chunks)}
+    return {
+        "message": "Document vectorized",
+        "document_id": document_id,
+        "num_chunks": len(vector_chunks),
+    }
 
 
 @router.post("/documents/publish")
@@ -600,22 +734,29 @@ async def publish_documents(document_ids: List[str]):
 
     with vector_db.get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             UPDATE documents SET status = 'published'
             WHERE id = ANY(%s) AND status = 'vectorized'
             RETURNING id
-        """, (document_ids,))
+        """,
+            (document_ids,),
+        )
         published = [str(row[0]) for row in cur.fetchall()]
         conn.commit()
         cur.close()
 
     logger.info(f"✅ Published {len(published)} documents")
-    return {"message": f"Published {len(published)} documents", "published_ids": published}
+    return {
+        "message": f"Published {len(published)} documents",
+        "published_ids": published,
+    }
 
 
 # ---------------------------------------------------------------------------
 # RAG Query
 # ---------------------------------------------------------------------------
+
 
 @router.post("/rag/query", response_model=RAGResponse)
 async def rag_query_endpoint(
@@ -627,7 +768,9 @@ async def rag_query_endpoint(
     history = _resolve_history_for_query(query, current_user)
     prompt_question = _question_with_conversation_context(query.question, history)
     try:
-        response = get_rag_engine().query(query, user_id, prompt_question=prompt_question)
+        response = get_rag_engine().query(
+            query, user_id, prompt_question=prompt_question
+        )
         logger.info(f"✅ RAG query by {user_id}: {query.question[:50]}...")
         return response
     except HTTPException as e:
@@ -682,7 +825,11 @@ async def rag_query_stream_endpoint(
     prompt, prompt_context_count = engine._build_prompt(prompt_question, results)
 
     engine.vector_db.log_query(
-        user_id, query.question, query.llm_provider.value, max_class.value, True,
+        user_id,
+        query.question,
+        query.llm_provider.value,
+        max_class.value,
+        True,
         details={
             "retrieved_count": len(results),
             "prompt_context_count": prompt_context_count,
@@ -691,7 +838,7 @@ async def rag_query_stream_endpoint(
             "prompt_k": RAG_PROMPT_K,
             "retrieve_k": RAG_RETRIEVE_K,
             "history_turn_count": len(history),
-        }
+        },
     )
 
     if query.llm_provider == LLMProvider.LOCAL:
@@ -809,7 +956,9 @@ async def rag_query_stream_events_endpoint(
                 },
             )
             prompt_start = time.perf_counter()
-            prompt, prompt_context_count = engine._build_prompt(prompt_question, results)
+            prompt, prompt_context_count = engine._build_prompt(
+                prompt_question, results
+            )
             prompt_ms = round((time.perf_counter() - prompt_start) * 1000, 2)
             timings_ms["prompt_build"] = prompt_ms
             yield _sse_event(
@@ -841,12 +990,16 @@ async def rag_query_stream_events_endpoint(
                 stream_iter = engine._ollama_stream(prompt)
                 error_code = "LOCAL_LLM_ERROR"
             else:
-                stream_iter = engine._openrouter_stream(prompt, temperature=query.temperature)
+                stream_iter = engine._openrouter_stream(
+                    prompt, temperature=query.temperature
+                )
                 error_code = "OPENROUTER_STREAM_ERROR"
 
             for token in stream_iter:
                 if token and token.lstrip().startswith("[Error]"):
-                    yield _sse_event("error", {"code": error_code, "message": token.strip()})
+                    yield _sse_event(
+                        "error", {"code": error_code, "message": token.strip()}
+                    )
                     yield _sse_event(
                         "status",
                         {
@@ -869,7 +1022,9 @@ async def rag_query_stream_events_endpoint(
             total_ms = round((time.perf_counter() - total_start) * 1000, 2)
             timings_ms["total"] = total_ms
 
-            max_class = engine._get_max_classification([r["classification"] for r in results])
+            max_class = engine._get_max_classification(
+                [r["classification"] for r in results]
+            )
 
             engine.vector_db.log_query(
                 user_id,
@@ -919,12 +1074,13 @@ async def rag_query_stream_events_endpoint(
 # Workflow
 # ---------------------------------------------------------------------------
 
+
 @router.post("/workflow/complete")
 async def complete_workflow(
     source_id: str,
     auto_approve_public: bool = True,
     chunking_config: ChunkingConfig = ChunkingConfig(),
-    vectorization_config: VectorizationConfig = VectorizationConfig()
+    vectorization_config: VectorizationConfig = VectorizationConfig(),
 ):
     """Complete workflow: Extract → Review → Vectorize → Publish"""
     workflow_id = str(uuid.uuid4())
@@ -934,21 +1090,27 @@ async def complete_workflow(
         # Step 1: Extract
         logger.info(f"[{workflow_id}] Step 1: Extracting")
         extract_result = await extract_data(source_id)
-        doc_ids = extract_result['document_ids']
+        doc_ids = extract_result["document_ids"]
 
         # Step 2: Auto-approve public docs without PII
         with vector_db.get_connection() as conn:
             cur = conn.cursor()
 
             if auto_approve_public:
-                cur.execute("""
+                cur.execute(
+                    """
                     UPDATE documents SET status = 'approved'
                     WHERE id = ANY(%s) AND classification = 'public' AND pii_detected = FALSE
-                """, (doc_ids,))
+                """,
+                    (doc_ids,),
+                )
                 conn.commit()
 
             # Step 3: Get approved
-            cur.execute("SELECT id FROM documents WHERE id = ANY(%s) AND status = 'approved'", (doc_ids,))
+            cur.execute(
+                "SELECT id FROM documents WHERE id = ANY(%s) AND status = 'approved'",
+                (doc_ids,),
+            )
             approved_ids = [str(row[0]) for row in cur.fetchall()]
             cur.close()
 
@@ -965,7 +1127,7 @@ async def complete_workflow(
             "workflow_id": workflow_id,
             "extracted": len(doc_ids),
             "approved": len(approved_ids),
-            "pending_review": len(doc_ids) - len(approved_ids)
+            "pending_review": len(doc_ids) - len(approved_ids),
         }
 
     except Exception as e:
@@ -976,6 +1138,7 @@ async def complete_workflow(
 # ---------------------------------------------------------------------------
 # Stats & Audit
 # ---------------------------------------------------------------------------
+
 
 @router.get("/stats")
 async def get_stats():
@@ -990,19 +1153,25 @@ async def get_audit_log(limit: int = 100):
 
     with vector_db.get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             SELECT timestamp, user_id, query, llm_provider, classification, success
             FROM audit_log ORDER BY timestamp DESC LIMIT %s
-        """, (limit,))
+        """,
+            (limit,),
+        )
 
-        logs = [{
-            'timestamp': row[0].isoformat(),
-            'user_id': row[1],
-            'query': row[2],
-            'llm_provider': row[3],
-            'classification': row[4],
-            'success': row[5]
-        } for row in cur.fetchall()]
+        logs = [
+            {
+                "timestamp": row[0].isoformat(),
+                "user_id": row[1],
+                "query": row[2],
+                "llm_provider": row[3],
+                "classification": row[4],
+                "success": row[5],
+            }
+            for row in cur.fetchall()
+        ]
 
         cur.close()
 

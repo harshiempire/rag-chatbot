@@ -293,6 +293,9 @@ Context:
 Question: {question_text}
 
 Provide a detailed answer based only on the information above. If you don't know, say so."""
+        if len(prompt) > MAX_PROMPT_CHARS:
+            # Final guard in case config values drift and prompt scaffolding exceeds expected bounds.
+            prompt = prompt[:MAX_PROMPT_CHARS].rstrip()
         return prompt, used
 
     def _generate_answer(self, query: RAGQuery, prompt: str) -> str:

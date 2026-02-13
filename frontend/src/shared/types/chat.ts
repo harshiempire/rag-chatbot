@@ -110,3 +110,11 @@ export interface ChatSession {
   updatedAt: number;
   messages: ChatMessage[];
 }
+
+export interface ChatSessionSummary {
+  id: string;
+  title: string;
+  llmProvider: LLMProvider;
+  createdAt: number;
+  updatedAt: number;
+}

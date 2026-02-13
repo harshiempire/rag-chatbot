@@ -149,7 +149,22 @@ class VectorDatabase:
                     messages JSONB NOT NULL DEFAULT '[]'::jsonb
                 )
             """)
-            cur.execute("ALTER TABLE chat_sessions ALTER COLUMN id TYPE TEXT")
+            cur.execute(
+                """
+                SELECT data_type
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'chat_sessions'
+                  AND column_name = 'id'
+                LIMIT 1
+                """
+            )
+            id_column = cur.fetchone()
+            if id_column and id_column[0] != "text":
+                logger.info("Migrating chat_sessions.id column to TEXT")
+                cur.execute(
+                    "ALTER TABLE chat_sessions ALTER COLUMN id TYPE TEXT USING id::text"
+                )
 
             # Create indexes
             cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status)")
@@ -535,6 +550,16 @@ class VectorDatabase:
             "messages": messages,
         }
 
+    @staticmethod
+    def _map_chat_session_summary_row(row: Any) -> Dict[str, Any]:
+        return {
+            "id": str(row[0]),
+            "title": row[1],
+            "llmProvider": row[2],
+            "createdAt": int(row[3]),
+            "updatedAt": int(row[4]),
+        }
+
     def list_chat_sessions(self, user_id: str) -> List[Dict[str, Any]]:
         with self.get_connection() as conn:
             cur = conn.cursor()
@@ -550,6 +575,22 @@ class VectorDatabase:
             rows = cur.fetchall()
             cur.close()
             return [self._map_chat_session_row(row) for row in rows]
+
+    def list_chat_session_summaries(self, user_id: str) -> List[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, title, llm_provider, created_at, updated_at
+                FROM chat_sessions
+                WHERE user_id = %s
+                ORDER BY updated_at DESC
+                """,
+                (user_id,),
+            )
+            rows = cur.fetchall()
+            cur.close()
+            return [self._map_chat_session_summary_row(row) for row in rows]
 
     def get_chat_session(self, user_id: str, session_id: str) -> Optional[Dict[str, Any]]:
         with self.get_connection() as conn:

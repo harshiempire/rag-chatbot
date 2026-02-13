@@ -1,4 +1,4 @@
-import type { ChatSession } from '../types/chat';
+import type { ChatSession, ChatSessionSummary } from '../types/chat';
 import { API_BASE_URL } from '../api/config';
 import { authorizedFetch } from '../api/httpClient';
 
@@ -10,7 +10,7 @@ export class ChatHistoryError extends Error {
 }
 
 export interface ChatHistoryStore {
-  listSessions(userId: string): Promise<ChatSession[]>;
+  listSessions(userId: string): Promise<ChatSessionSummary[]>;
   getSession(userId: string, sessionId: string): Promise<ChatSession | null>;
   saveSession(userId: string, session: ChatSession): Promise<ChatSession>;
   deleteSession(userId: string, sessionId: string): Promise<void>;
@@ -33,11 +33,11 @@ async function parseResponse<T>(response: Response): Promise<T> {
 }
 
 export class ApiHistoryStore implements ChatHistoryStore {
-  async listSessions(_userId: string): Promise<ChatSession[]> {
-    const response = await authorizedFetch(`${API_BASE_URL}/chat/sessions`, {
+  async listSessions(_userId: string): Promise<ChatSessionSummary[]> {
+    const response = await authorizedFetch(`${API_BASE_URL}/chat/sessions/summary`, {
       method: 'GET',
     });
-    return parseResponse<ChatSession[]>(response);
+    return parseResponse<ChatSessionSummary[]>(response);
   }
 
   async getSession(_userId: string, sessionId: string): Promise<ChatSession | null> {

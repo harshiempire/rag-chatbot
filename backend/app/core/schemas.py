@@ -5,6 +5,7 @@ All request/response models and configuration schemas used
 across the application. Imports enums and secrets from core.
 """
 
+import os
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
@@ -20,6 +21,8 @@ from app.core.enums import (
     SourceType,
 )
 from app.core.secrets import SecretField
+
+MAX_RAG_QUESTION_CHARS = int(os.getenv("RAG_MAX_QUESTION_CHARS", "2200"))
 
 
 class AuthConfig(BaseModel):
@@ -114,7 +117,7 @@ class ReviewDecision(BaseModel):
 
 class RAGQuery(BaseModel):
     """RAG query request"""
-    question: str
+    question: str = Field(max_length=MAX_RAG_QUESTION_CHARS)
     llm_provider: LLMProvider
     classification_filter: Optional[List[DataClassification]] = None
     source_id: Optional[str] = None
@@ -193,6 +196,16 @@ class ChatHistoryTurn(BaseModel):
 
     role: Literal["user", "assistant"]
     content: str
+
+
+class ChatSessionSummaryPayload(BaseModel):
+    """Persisted chat session metadata."""
+
+    id: str
+    title: str
+    llmProvider: LLMProvider
+    createdAt: int
+    updatedAt: int
 
 
 class ChatSessionPayload(BaseModel):
