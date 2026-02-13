@@ -267,12 +267,14 @@ def _question_with_conversation_context(question: str, history: List[Dict[str, s
     lines = list(reversed(lines_reversed))
     omission_marker = "[Earlier turns omitted due to prompt budget]"
     if len(lines) < len(history):
-        candidate_lines = [omission_marker, *lines]
-        while lines and len("\n".join(candidate_lines)) > history_budget:
-            lines.pop(0)
-            candidate_lines = [omission_marker, *lines]
+        trimmed_lines = lines[:]
+        candidate_lines = [omission_marker, *trimmed_lines]
+        while trimmed_lines and len("\n".join(candidate_lines)) > history_budget:
+            trimmed_lines.pop(0)
+            candidate_lines = [omission_marker, *trimmed_lines]
         if len("\n".join(candidate_lines)) <= history_budget:
             lines = candidate_lines
+
 
     history_block = "\n".join(lines).strip()
     if not history_block:
