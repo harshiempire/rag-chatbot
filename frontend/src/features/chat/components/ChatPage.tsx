@@ -195,6 +195,35 @@ function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError';
 }
 
+const PROVIDER_PREFERENCE_KEY = 'rag_provider_pref_v1';
+
+function isLlmProvider(value: string): value is LLMProvider {
+  return value === 'local' || value === 'openai' || value === 'anthropic' || value === 'google' || value === 'openrouter';
+}
+
+function readProviderPreference(userId: string): LLMProvider | null {
+  if (!userId || typeof localStorage === 'undefined') {
+    return null;
+  }
+  try {
+    const raw = localStorage.getItem(`${PROVIDER_PREFERENCE_KEY}:${userId}`);
+    return raw && isLlmProvider(raw) ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeProviderPreference(userId: string, provider: LLMProvider): void {
+  if (!userId || typeof localStorage === 'undefined') {
+    return;
+  }
+  try {
+    localStorage.setItem(`${PROVIDER_PREFERENCE_KEY}:${userId}`, provider);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
 export function ChatPage() {
   const { user, logout } = useAuth();
   const userId = user?.id ?? '';
@@ -203,6 +232,7 @@ export function ChatPage() {
   const [provider, setProvider] = useState<LLMProvider>('local');
   const [_composerError, setComposerError] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [isNewChatMode, setIsNewChatMode] = useState(false);
 
   const sessionQuery = useChatSessionQuery(userId, selectedSessionId);
   const saveSessionMutation = useSaveSessionMutation(userId);
@@ -219,10 +249,20 @@ export function ChatPage() {
   }, [state]);
 
   useEffect(() => {
+    const preferred = readProviderPreference(userId);
+    if (preferred) {
+      setProvider(preferred);
+    }
+  }, [userId]);
+
+  useEffect(() => {
+    if (isNewChatMode) {
+      return;
+    }
     if (!selectedSessionId && sessionsQuery.data?.length) {
       setSelectedSessionId(sessionsQuery.data[0].id);
     }
-  }, [selectedSessionId, sessionsQuery.data]);
+  }, [selectedSessionId, sessionsQuery.data, isNewChatMode]);
 
   useEffect(() => {
     if (!sessionQuery.data || state.streamingMessageId) {
@@ -231,6 +271,7 @@ export function ChatPage() {
 
     dispatch({ type: 'set_session', session: sessionQuery.data });
     setProvider(sessionQuery.data.llmProvider);
+    setIsNewChatMode(false);
   }, [sessionQuery.data, state.streamingMessageId]);
 
   const sessions = useMemo(() => {
@@ -298,6 +339,7 @@ export function ChatPage() {
     };
 
     setSelectedSessionId(nextSession.id);
+    setIsNewChatMode(false);
     dispatch({ type: 'start_stream', session: nextSession, assistantMessageId });
 
     const request: RAGStreamRequest = {
@@ -308,6 +350,11 @@ export function ChatPage() {
       top_k: RAG_DEFAULT_TOP_K,
       temperature: 0.7,
       min_similarity: 0.2,
+      session_id: nextSession.id,
+      chat_history: startingSession.messages
+        .filter((message) => message.role === 'user' || message.role === 'assistant')
+        .map((message) => ({ role: message.role, content: message.content }))
+        .slice(-12),
     };
 
     const abortController = new AbortController();
@@ -412,8 +459,8 @@ export function ChatPage() {
 
   const onNewChat = () => {
     setSelectedSessionId(null);
+    setIsNewChatMode(true);
     dispatch({ type: 'reset' });
-    setProvider('local');
     setComposerError(null);
   };
 
@@ -431,7 +478,9 @@ export function ChatPage() {
         setSelectedSessionId(nextSession?.id ?? null);
         if (!nextSession) {
           dispatch({ type: 'reset' });
-          setProvider('local');
+          setIsNewChatMode(true);
+        } else {
+          setIsNewChatMode(false);
         }
       }
     } catch (error) {
@@ -463,6 +512,7 @@ export function ChatPage() {
           }}
           onSelectSession={(id) => {
             setSelectedSessionId(id);
+            setIsNewChatMode(false);
             setIsSidebarOpen(false);
           }}
           onDeleteSession={onDeleteSession}
@@ -490,7 +540,11 @@ export function ChatPage() {
               <div className="flex items-center gap-2 mt-1">
                 <select
                   value={provider}
-                  onChange={(e) => setProvider(e.target.value as LLMProvider)}
+                  onChange={(e) => {
+                    const nextProvider = e.target.value as LLMProvider;
+                    setProvider(nextProvider);
+                    writeProviderPreference(userId, nextProvider);
+                  }}
                   className="bg-slate-900/50 border border-slate-800 text-xs text-slate-400 rounded-md px-2 py-1 outline-none focus:border-slate-600 focus:text-slate-200 transition-colors cursor-pointer"
                 >
                   <option value="local">Local Model</option>

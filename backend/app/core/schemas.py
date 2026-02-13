@@ -121,6 +121,8 @@ class RAGQuery(BaseModel):
     top_k: int = 5
     temperature: float = 0.7
     min_similarity: float = 0.2
+    session_id: Optional[str] = None
+    chat_history: Optional[List[Dict[str, str]]] = None
 
 
 class RAGResponse(BaseModel):
@@ -184,3 +186,21 @@ class AuthMessageResponse(BaseModel):
     """Simple auth response message."""
 
     message: str
+
+
+class ChatHistoryTurn(BaseModel):
+    """Conversation turn used for context."""
+
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ChatSessionPayload(BaseModel):
+    """Persisted chat session payload."""
+
+    id: str
+    title: str
+    llmProvider: LLMProvider
+    createdAt: int
+    updatedAt: int
+    messages: List[Dict[str, Any]] = Field(default_factory=list)

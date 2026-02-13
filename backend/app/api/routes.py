@@ -35,6 +35,7 @@ from app.core.enums import DataClassification, DocumentStatus, LLMProvider
 from app.core.schemas import (
     AuthMessageResponse,
     AuthTokenResponse,
+    ChatSessionPayload,
     ChunkingConfig,
     DataSourceDefinition,
     RAGQuery,
@@ -68,6 +69,8 @@ _pii_detector = PIIDetector()
 
 # In-memory storage (replace with DB in production)
 data_sources: Dict[str, DataSourceDefinition] = {}
+CHAT_HISTORY_MAX_TURNS = 12
+CHAT_HISTORY_MAX_CHARS_PER_TURN = 1000
 
 
 def _sse_event(event_type: str, data: Dict[str, Any]) -> str:
@@ -177,6 +180,59 @@ def get_current_user(
     return user
 
 
+def _normalize_chat_history(messages: List[Dict[str, Any]] | None) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    for item in messages or []:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        trimmed = content.strip()
+        if not trimmed:
+            continue
+        normalized.append(
+            {
+                "role": role,
+                "content": trimmed[:CHAT_HISTORY_MAX_CHARS_PER_TURN],
+            }
+        )
+    return normalized[-CHAT_HISTORY_MAX_TURNS:]
+
+
+def _resolve_history_for_query(query: RAGQuery, current_user: Dict[str, Any]) -> List[Dict[str, str]]:
+    history = _normalize_chat_history(query.chat_history)
+    if history:
+        return history
+
+    if not query.session_id:
+        return []
+
+    session = get_vector_db().get_chat_session(str(current_user["id"]), query.session_id)
+    if not session:
+        return []
+    return _normalize_chat_history(session.get("messages", []))
+
+
+def _question_with_conversation_context(question: str, history: List[Dict[str, str]]) -> str:
+    if not history:
+        return question
+
+    lines = []
+    for message in history:
+        prefix = "User" if message["role"] == "user" else "Assistant"
+        lines.append(f"{prefix}: {message['content']}")
+
+    history_block = "\n".join(lines)
+    return (
+        "Use the prior conversation context when relevant. "
+        "If history conflicts with retrieved legal context, prioritize retrieved context.\n\n"
+        f"Conversation History:\n{history_block}\n\n"
+        f"Current User Question:\n{question}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
@@ -272,6 +328,49 @@ async def logout(
 async def get_me(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Get the currently authenticated user."""
     return _build_user_public(current_user)
+
+
+# ---------------------------------------------------------------------------
+# Chat Sessions
+# ---------------------------------------------------------------------------
+
+@router.get("/chat/sessions", response_model=List[ChatSessionPayload])
+async def list_chat_sessions(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """List chat sessions for the authenticated user."""
+    return get_vector_db().list_chat_sessions(str(current_user["id"]))
+
+
+@router.get("/chat/sessions/{session_id}", response_model=ChatSessionPayload)
+async def get_chat_session(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Fetch a single chat session for the authenticated user."""
+    session = get_vector_db().get_chat_session(str(current_user["id"]), session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+    return session
+
+
+@router.put("/chat/sessions/{session_id}", response_model=ChatSessionPayload)
+async def save_chat_session(
+    session_id: str,
+    payload: ChatSessionPayload,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Create or update a chat session payload for the authenticated user."""
+    if payload.id != session_id:
+        raise HTTPException(status_code=400, detail="Path session id must match payload id.")
+    try:
+        return get_vector_db().save_chat_session(str(current_user["id"]), payload.dict())
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.delete("/chat/sessions/{session_id}", response_model=AuthMessageResponse)
+async def delete_chat_session(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Delete a chat session for the authenticated user."""
+    deleted = get_vector_db().delete_chat_session(str(current_user["id"]), session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+    return AuthMessageResponse(message="Chat session deleted.")
 
 
 # ---------------------------------------------------------------------------
@@ -471,8 +570,10 @@ async def rag_query_endpoint(
 ):
     """Query RAG system with security controls"""
     user_id = str(current_user["id"])
+    history = _resolve_history_for_query(query, current_user)
+    prompt_question = _question_with_conversation_context(query.question, history)
     try:
-        response = get_rag_engine().query(query, user_id)
+        response = get_rag_engine().query(query, user_id, prompt_question=prompt_question)
         logger.info(f"✅ RAG query by {user_id}: {query.question[:50]}...")
         return response
     except HTTPException as e:
@@ -490,6 +591,8 @@ async def rag_query_stream_endpoint(
 ):
     """Streaming RAG response (text/plain) for LOCAL and OPENROUTER providers."""
     user_id = str(current_user["id"])
+    history = _resolve_history_for_query(query, current_user)
+    prompt_question = _question_with_conversation_context(query.question, history)
     if query.llm_provider not in {LLMProvider.LOCAL, LLMProvider.OPENROUTER}:
         raise HTTPException(
             status_code=400,
@@ -522,7 +625,7 @@ async def rag_query_stream_endpoint(
 
     max_class = engine._get_max_classification([r["classification"] for r in results])
 
-    prompt, prompt_context_count = engine._build_prompt(query.question, results)
+    prompt, prompt_context_count = engine._build_prompt(prompt_question, results)
 
     engine.vector_db.log_query(
         user_id, query.question, query.llm_provider.value, max_class.value, True,
@@ -533,6 +636,7 @@ async def rag_query_stream_endpoint(
             "timings_ms": {"embed": embed_ms, "search": search_ms},
             "prompt_k": RAG_PROMPT_K,
             "retrieve_k": RAG_RETRIEVE_K,
+            "history_turn_count": len(history),
         }
     )
 
@@ -562,6 +666,8 @@ async def rag_query_stream_events_endpoint(
 
     engine = get_rag_engine()
     user_id = str(current_user["id"])
+    history = _resolve_history_for_query(query, current_user)
+    prompt_question = _question_with_conversation_context(query.question, history)
     classifications = query.classification_filter or [DataClassification.PUBLIC]
     engine._validate_llm_access(query.llm_provider, classifications)
 
@@ -649,7 +755,7 @@ async def rag_query_stream_events_endpoint(
                 },
             )
             prompt_start = time.perf_counter()
-            prompt, prompt_context_count = engine._build_prompt(query.question, results)
+            prompt, prompt_context_count = engine._build_prompt(prompt_question, results)
             prompt_ms = round((time.perf_counter() - prompt_start) * 1000, 2)
             timings_ms["prompt_build"] = prompt_ms
             yield _sse_event(
@@ -724,6 +830,7 @@ async def rag_query_stream_events_endpoint(
                     "timings_ms": timings_ms,
                     "prompt_k": RAG_PROMPT_K,
                     "retrieve_k": RAG_RETRIEVE_K,
+                    "history_turn_count": len(history),
                 },
             )
 

@@ -1,10 +1,6 @@
 import type { ChatSession } from '../types/chat';
-
-const STORAGE_KEY = 'rag_chat_v1';
-
-interface ChatHistoryEnvelope {
-  sessions: Record<string, ChatSession>;
-}
+import { API_BASE_URL } from '../api/config';
+import { authorizedFetch } from '../api/httpClient';
 
 export class ChatHistoryError extends Error {
   constructor(message: string) {
@@ -20,84 +16,55 @@ export interface ChatHistoryStore {
   deleteSession(userId: string, sessionId: string): Promise<void>;
 }
 
-export class LocalStorageHistoryStore implements ChatHistoryStore {
-  private toScopedKey(userId: string): string {
-    const normalized = userId.trim().toLowerCase();
-    return `${STORAGE_KEY}:${normalized}`;
-  }
-
-  private readEnvelope(userId: string): ChatHistoryEnvelope {
-    const raw = this.readStorage(this.toScopedKey(userId));
-    if (!raw) {
-      return { sessions: {} };
-    }
-
+async function parseResponse<T>(response: Response): Promise<T> {
+  if (!response.ok) {
+    let detail = `Request failed with status ${response.status}`;
     try {
-      const parsed = JSON.parse(raw) as ChatHistoryEnvelope;
-      return parsed?.sessions ? parsed : { sessions: {} };
+      const body = (await response.json()) as { detail?: string };
+      if (body?.detail) {
+        detail = body.detail;
+      }
     } catch {
-      // Recover from malformed local data without crashing the UI.
-      return { sessions: {} };
+      // Keep fallback detail.
     }
+    throw new ChatHistoryError(detail);
+  }
+  return (await response.json()) as T;
+}
+
+export class ApiHistoryStore implements ChatHistoryStore {
+  async listSessions(_userId: string): Promise<ChatSession[]> {
+    const response = await authorizedFetch(`${API_BASE_URL}/chat/sessions`, {
+      method: 'GET',
+    });
+    return parseResponse<ChatSession[]>(response);
   }
 
-  private writeEnvelope(userId: string, envelope: ChatHistoryEnvelope): void {
-    this.writeStorage(this.toScopedKey(userId), JSON.stringify(envelope));
-  }
-
-  private readStorage(key: string): string | null {
-    if (typeof localStorage === 'undefined') {
-      throw new ChatHistoryError('Local storage is unavailable in this environment.');
+  async getSession(_userId: string, sessionId: string): Promise<ChatSession | null> {
+    const response = await authorizedFetch(`${API_BASE_URL}/chat/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'GET',
+    });
+    if (response.status === 404) {
+      return null;
     }
-
-    try {
-      return localStorage.getItem(key);
-    } catch (error) {
-      throw new ChatHistoryError(
-        `Unable to read local chat history: ${error instanceof Error ? error.message : 'unknown error'}`
-      );
-    }
+    return parseResponse<ChatSession>(response);
   }
 
-  private writeStorage(key: string, value: string): void {
-    if (typeof localStorage === 'undefined') {
-      throw new ChatHistoryError('Local storage is unavailable in this environment.');
-    }
-
-    try {
-      localStorage.setItem(key, value);
-    } catch (error) {
-      throw new ChatHistoryError(
-        `Unable to save chat history locally: ${error instanceof Error ? error.message : 'unknown error'}`
-      );
-    }
+  async saveSession(_userId: string, session: ChatSession): Promise<ChatSession> {
+    const response = await authorizedFetch(`${API_BASE_URL}/chat/sessions/${encodeURIComponent(session.id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(session),
+    });
+    return parseResponse<ChatSession>(response);
   }
 
-  async listSessions(userId: string): Promise<ChatSession[]> {
-    const envelope = this.readEnvelope(userId);
-    return Object.values(envelope.sessions).sort((a, b) => b.updatedAt - a.updatedAt);
-  }
-
-  async getSession(userId: string, sessionId: string): Promise<ChatSession | null> {
-    const envelope = this.readEnvelope(userId);
-    return envelope.sessions[sessionId] ?? null;
-  }
-
-  async saveSession(userId: string, session: ChatSession): Promise<ChatSession> {
-    const envelope = this.readEnvelope(userId);
-    envelope.sessions[session.id] = session;
-    this.writeEnvelope(userId, envelope);
-    return session;
-  }
-
-  async deleteSession(userId: string, sessionId: string): Promise<void> {
-    const envelope = this.readEnvelope(userId);
-    delete envelope.sessions[sessionId];
-    this.writeEnvelope(userId, envelope);
+  async deleteSession(_userId: string, sessionId: string): Promise<void> {
+    const response = await authorizedFetch(`${API_BASE_URL}/chat/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'DELETE',
+    });
+    await parseResponse<{ message: string }>(response);
   }
 }
 
-export const chatHistoryStore: ChatHistoryStore = new LocalStorageHistoryStore();
-
-// Future plug-and-play replacement:
-// export const chatHistoryStore: ChatHistoryStore = new ApiHistoryStore(...)
+export const chatHistoryStore: ChatHistoryStore = new ApiHistoryStore();

@@ -137,6 +137,20 @@ class VectorDatabase:
                 )
             """)
 
+            # Chat sessions table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id TEXT PRIMARY KEY,
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    llm_provider VARCHAR(50) NOT NULL,
+                    created_at BIGINT NOT NULL,
+                    updated_at BIGINT NOT NULL,
+                    messages JSONB NOT NULL DEFAULT '[]'::jsonb
+                )
+            """)
+            cur.execute("ALTER TABLE chat_sessions ALTER COLUMN id TYPE TEXT")
+
             # Create indexes
             cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_classification ON documents(classification)")
@@ -145,6 +159,8 @@ class VectorDatabase:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires_at ON refresh_tokens(expires_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id ON chat_sessions(user_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated_at ON chat_sessions(updated_at DESC)")
 
             conn.commit()
             cur.close()
@@ -495,3 +511,112 @@ class VectorDatabase:
             )
             conn.commit()
             cur.close()
+
+    # ---------------------------------------------------------------------
+    # Chat session helpers
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _map_chat_session_row(row: Any) -> Dict[str, Any]:
+        messages = row[6]
+        if isinstance(messages, str):
+            try:
+                messages = json.loads(messages)
+            except json.JSONDecodeError:
+                messages = []
+        if not isinstance(messages, list):
+            messages = []
+        return {
+            "id": str(row[0]),
+            "title": row[2],
+            "llmProvider": row[3],
+            "createdAt": int(row[4]),
+            "updatedAt": int(row[5]),
+            "messages": messages,
+        }
+
+    def list_chat_sessions(self, user_id: str) -> List[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, user_id, title, llm_provider, created_at, updated_at, messages
+                FROM chat_sessions
+                WHERE user_id = %s
+                ORDER BY updated_at DESC
+                """,
+                (user_id,),
+            )
+            rows = cur.fetchall()
+            cur.close()
+            return [self._map_chat_session_row(row) for row in rows]
+
+    def get_chat_session(self, user_id: str, session_id: str) -> Optional[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, user_id, title, llm_provider, created_at, updated_at, messages
+                FROM chat_sessions
+                WHERE user_id = %s AND id = %s
+                LIMIT 1
+                """,
+                (user_id, session_id),
+            )
+            row = cur.fetchone()
+            cur.close()
+            return self._map_chat_session_row(row) if row else None
+
+    def save_chat_session(self, user_id: str, session: Dict[str, Any]) -> Dict[str, Any]:
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            llm_provider = session["llmProvider"]
+            if hasattr(llm_provider, "value"):
+                llm_provider = llm_provider.value
+            cur.execute(
+                """
+                INSERT INTO chat_sessions (
+                    id, user_id, title, llm_provider, created_at, updated_at, messages
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE
+                SET title = EXCLUDED.title,
+                    llm_provider = EXCLUDED.llm_provider,
+                    updated_at = EXCLUDED.updated_at,
+                    messages = EXCLUDED.messages
+                WHERE chat_sessions.user_id = EXCLUDED.user_id
+                RETURNING id, user_id, title, llm_provider, created_at, updated_at, messages
+                """,
+                (
+                    session["id"],
+                    user_id,
+                    session["title"],
+                    llm_provider,
+                    int(session["createdAt"]),
+                    int(session["updatedAt"]),
+                    json.dumps(session.get("messages", [])),
+                ),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                cur.close()
+                raise ValueError("Session id is already used by another user.")
+            conn.commit()
+            cur.close()
+            return self._map_chat_session_row(row)
+
+    def delete_chat_session(self, user_id: str, session_id: str) -> bool:
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                DELETE FROM chat_sessions
+                WHERE user_id = %s AND id = %s
+                """,
+                (user_id, session_id),
+            )
+            deleted = cur.rowcount > 0
+            conn.commit()
+            cur.close()
+            return deleted

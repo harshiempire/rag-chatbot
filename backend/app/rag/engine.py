@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import anthropic
 import openai
@@ -53,7 +53,9 @@ class RAGEngine:
         else:
             self.gemini_client = None
 
-    def query(self, rag_query: RAGQuery, user_id: str) -> RAGResponse:
+    def query(
+        self, rag_query: RAGQuery, user_id: str, prompt_question: Optional[str] = None
+    ) -> RAGResponse:
         """Execute RAG query with security"""
         total_start = time.perf_counter()
         timings_ms: Dict[str, float] = {}
@@ -85,7 +87,8 @@ class RAGEngine:
         max_class = self._get_max_classification([r["classification"] for r in results])
 
         prompt_start = time.perf_counter()
-        prompt, prompt_context_count = self._build_prompt(rag_query.question, results)
+        prompt_input = prompt_question or rag_query.question
+        prompt, prompt_context_count = self._build_prompt(prompt_input, results)
         timings_ms["prompt_build"] = round(
             (time.perf_counter() - prompt_start) * 1000, 2
         )
