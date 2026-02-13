@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from app.config import (
     AUTH_COOKIE_SAMESITE,
     AUTH_COOKIE_SECURE,
+    RAG_MAX_QUESTION_CHARS,
     REFRESH_COOKIE_NAME,
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
@@ -51,7 +52,6 @@ from app.core.schemas import (
 from app.extraction.dynamic import DynamicExtractor
 from app.extraction.pii import PIIDetector
 from app.rag.engine import (
-    MAX_QUESTION_CHARS,
     RAG_PROMPT_K,
     RAG_RETRIEVE_K,
     RAGEngine,
@@ -86,6 +86,15 @@ CHAT_SESSION_MAX_MESSAGE_CONTENT_CHARS = int(
 CHAT_SESSION_MAX_PAYLOAD_BYTES = int(
     os.getenv("CHAT_SESSION_MAX_PAYLOAD_BYTES", "1048576")
 )
+RESERVED_CHAT_SESSION_IDS = {"summary"}
+
+
+def _validate_chat_session_id(session_id: str) -> None:
+    if (session_id or "").strip().lower() in RESERVED_CHAT_SESSION_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Session id '{session_id}' is reserved and cannot be used.",
+        )
 
 
 def _sse_event(event_type: str, data: Dict[str, Any]) -> str:
@@ -306,7 +315,7 @@ def _question_with_conversation_context(
     )
     history_budget = min(
         CHAT_HISTORY_MAX_TOTAL_CHARS,
-        max(0, MAX_QUESTION_CHARS - fixed_chars),
+        max(0, RAG_MAX_QUESTION_CHARS - fixed_chars),
     )
     if history_budget <= 0:
         return question_text
@@ -494,10 +503,11 @@ async def save_chat_session(
         raise HTTPException(
             status_code=400, detail="Path session id must match payload id."
         )
+    _validate_chat_session_id(session_id)
     _enforce_chat_session_limits(payload)
     try:
         return get_vector_db().save_chat_session(
-            str(current_user["id"]), payload.dict()
+            str(current_user["id"]), payload.model_dump(mode="json")
         )
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc

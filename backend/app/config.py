@@ -17,6 +17,9 @@ DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://user:pass@localhost:5432/
 # CORS
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:5173")
 
+# RAG limits
+RAG_MAX_QUESTION_CHARS = int(os.getenv("RAG_MAX_QUESTION_CHARS", "2200"))
+
 # Auth
 ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET", "change-this-in-production")
 REFRESH_TOKEN_PEPPER = os.getenv("REFRESH_TOKEN_PEPPER", ACCESS_TOKEN_SECRET)

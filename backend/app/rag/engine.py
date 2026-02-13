@@ -18,6 +18,7 @@ import requests
 from fastapi import HTTPException
 from google import genai
 
+from app.config import RAG_MAX_QUESTION_CHARS
 from app.core.database import VectorDatabase
 from app.core.enums import DataClassification, LLMProvider
 from app.core.schemas import RAGQuery, RAGResponse
@@ -31,7 +32,7 @@ RAG_PROMPT_K = int(os.getenv("RAG_PROMPT_K", "3"))
 MAX_CHUNK_CHARS = int(os.getenv("RAG_MAX_CHUNK_CHARS", "1200"))
 MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "6000"))
 MAX_PROMPT_CHARS = int(os.getenv("RAG_MAX_PROMPT_CHARS", "10000"))
-MAX_QUESTION_CHARS = int(os.getenv("RAG_MAX_QUESTION_CHARS", "2200"))
+MAX_QUESTION_CHARS = RAG_MAX_QUESTION_CHARS
 PROMPT_SCAFFOLD_CHARS = int(os.getenv("RAG_PROMPT_SCAFFOLD_CHARS", "900"))
 RAG_MIN_DISTINCT_SECTIONS = int(os.getenv("RAG_MIN_DISTINCT_SECTIONS", "2"))
 

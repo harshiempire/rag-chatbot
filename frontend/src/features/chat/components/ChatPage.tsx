@@ -513,6 +513,10 @@ export function ChatPage() {
   };
 
   const onNewChat = () => {
+    const preferred = readProviderPreference(userId);
+    if (preferred) {
+      setProvider(preferred);
+    }
     setSelectedSessionId(null);
     setIsNewChatMode(true);
     dispatch({ type: 'reset' });

@@ -5,13 +5,13 @@ All request/response models and configuration schemas used
 across the application. Imports enums and secrets from core.
 """
 
-import os
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, validator
 
+from app.config import RAG_MAX_QUESTION_CHARS
 from app.core.enums import (
     AuthType,
     ChunkingStrategy,
@@ -21,8 +21,6 @@ from app.core.enums import (
     SourceType,
 )
 from app.core.secrets import SecretField
-
-MAX_RAG_QUESTION_CHARS = int(os.getenv("RAG_MAX_QUESTION_CHARS", "2200"))
 
 
 class AuthConfig(BaseModel):
@@ -117,7 +115,7 @@ class ReviewDecision(BaseModel):
 
 class RAGQuery(BaseModel):
     """RAG query request"""
-    question: str = Field(max_length=MAX_RAG_QUESTION_CHARS)
+    question: str = Field(max_length=RAG_MAX_QUESTION_CHARS)
     llm_provider: LLMProvider
     classification_filter: Optional[List[DataClassification]] = None
     source_id: Optional[str] = None
