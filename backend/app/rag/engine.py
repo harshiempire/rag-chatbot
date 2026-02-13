@@ -279,10 +279,11 @@ Question: {question_text}
 Provide a detailed answer based only on the information above. If you don't know, say so."""
 
         if len(prompt) > MAX_PROMPT_CHARS:
-            overflow = len(prompt) - MAX_PROMPT_CHARS
+            suffix = "\n...[context truncated for prompt budget]"
+            overflow = len(prompt) - MAX_PROMPT_CHARS + len(suffix)
             trimmed_context = context[: max(0, len(context) - overflow)].rstrip()
             if trimmed_context and len(trimmed_context) < len(context):
-                trimmed_context = f"{trimmed_context}\n...[context truncated for prompt budget]"
+                trimmed_context = f"{trimmed_context}{suffix}"
             prompt = f"""Based on the regulatory documents below, answer the question.
 
 Context:
