@@ -1,5 +1,5 @@
 
-import { MessageSquare, Plus, Trash2 } from "lucide-react";
+import { LogOut, MessageSquare, Plus, Trash2 } from "lucide-react";
 import { format, isToday, isYesterday } from "date-fns";
 import { cn } from "../../../../shared/utils/cn";
 import { Button } from "../ui/Button";
@@ -8,6 +8,8 @@ import type { ChatSession } from "../../../../shared/types/chat";
 interface SidebarProps {
     sessions: ChatSession[];
     selectedSessionId: string | null;
+    userEmail: string;
+    onLogout: () => void;
     onSelectSession: (id: string) => void;
     onDeleteSession: (id: string) => void;
     onNewChat: () => void;
@@ -17,6 +19,8 @@ interface SidebarProps {
 export function Sidebar({
     sessions,
     selectedSessionId,
+    userEmail,
+    onLogout,
     onSelectSession,
     onDeleteSession,
     onNewChat,
@@ -43,6 +47,9 @@ export function Sidebar({
     }, {} as Record<string, ChatSession[]>);
 
     const groups = ["Today", "Yesterday", ...Object.keys(groupedSessions).filter(k => k !== "Today" && k !== "Yesterday")];
+
+    const userLabel = userEmail.split("@")[0] || "User";
+    const avatar = userEmail.slice(0, 1).toUpperCase() || "U";
 
     return (
         <div className="flex flex-col h-full bg-slate-900 border-r border-slate-800 w-[260px] flex-shrink-0">
@@ -114,11 +121,20 @@ export function Sidebar({
             <div className="p-4 border-t border-slate-800">
                 <div className="flex items-center gap-2 px-2 py-3 mt-auto">
                     <div className="h-8 w-8 rounded-full bg-gradient-to-tr from-blue-500 to-purple-500 flex items-center justify-center text-white font-bold text-xs">
-                        U
+                        {avatar}
                     </div>
                     <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium text-slate-200 truncate">User</p>
+                        <p className="text-sm font-medium text-slate-200 truncate">{userLabel}</p>
+                        <p className="text-xs text-slate-500 truncate">{userEmail}</p>
                     </div>
+                    <button
+                        type="button"
+                        onClick={onLogout}
+                        className="rounded-md p-1.5 text-slate-500 hover:text-slate-200 hover:bg-slate-800 transition-colors"
+                        title="Log out"
+                    >
+                        <LogOut className="h-4 w-4" />
+                    </button>
                 </div>
             </div>
         </div>

@@ -14,15 +14,20 @@ export class ChatHistoryError extends Error {
 }
 
 export interface ChatHistoryStore {
-  listSessions(): Promise<ChatSession[]>;
-  getSession(sessionId: string): Promise<ChatSession | null>;
-  saveSession(session: ChatSession): Promise<ChatSession>;
-  deleteSession(sessionId: string): Promise<void>;
+  listSessions(userId: string): Promise<ChatSession[]>;
+  getSession(userId: string, sessionId: string): Promise<ChatSession | null>;
+  saveSession(userId: string, session: ChatSession): Promise<ChatSession>;
+  deleteSession(userId: string, sessionId: string): Promise<void>;
 }
 
 export class LocalStorageHistoryStore implements ChatHistoryStore {
-  private readEnvelope(): ChatHistoryEnvelope {
-    const raw = this.readStorage(STORAGE_KEY);
+  private toScopedKey(userId: string): string {
+    const normalized = userId.trim().toLowerCase();
+    return `${STORAGE_KEY}:${normalized}`;
+  }
+
+  private readEnvelope(userId: string): ChatHistoryEnvelope {
+    const raw = this.readStorage(this.toScopedKey(userId));
     if (!raw) {
       return { sessions: {} };
     }
@@ -36,8 +41,8 @@ export class LocalStorageHistoryStore implements ChatHistoryStore {
     }
   }
 
-  private writeEnvelope(envelope: ChatHistoryEnvelope): void {
-    this.writeStorage(STORAGE_KEY, JSON.stringify(envelope));
+  private writeEnvelope(userId: string, envelope: ChatHistoryEnvelope): void {
+    this.writeStorage(this.toScopedKey(userId), JSON.stringify(envelope));
   }
 
   private readStorage(key: string): string | null {
@@ -68,27 +73,27 @@ export class LocalStorageHistoryStore implements ChatHistoryStore {
     }
   }
 
-  async listSessions(): Promise<ChatSession[]> {
-    const envelope = this.readEnvelope();
+  async listSessions(userId: string): Promise<ChatSession[]> {
+    const envelope = this.readEnvelope(userId);
     return Object.values(envelope.sessions).sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
-  async getSession(sessionId: string): Promise<ChatSession | null> {
-    const envelope = this.readEnvelope();
+  async getSession(userId: string, sessionId: string): Promise<ChatSession | null> {
+    const envelope = this.readEnvelope(userId);
     return envelope.sessions[sessionId] ?? null;
   }
 
-  async saveSession(session: ChatSession): Promise<ChatSession> {
-    const envelope = this.readEnvelope();
+  async saveSession(userId: string, session: ChatSession): Promise<ChatSession> {
+    const envelope = this.readEnvelope(userId);
     envelope.sessions[session.id] = session;
-    this.writeEnvelope(envelope);
+    this.writeEnvelope(userId, envelope);
     return session;
   }
 
-  async deleteSession(sessionId: string): Promise<void> {
-    const envelope = this.readEnvelope();
+  async deleteSession(userId: string, sessionId: string): Promise<void> {
+    const envelope = this.readEnvelope(userId);
     delete envelope.sessions[sessionId];
-    this.writeEnvelope(envelope);
+    this.writeEnvelope(userId, envelope);
   }
 }
 

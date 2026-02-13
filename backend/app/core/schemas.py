@@ -133,3 +133,54 @@ class RAGResponse(BaseModel):
     prompt_context_count: int
     total_ms: float
     timings_ms: Dict[str, float]
+
+
+class UserSignupRequest(BaseModel):
+    """User registration payload."""
+
+    email: str
+    password: str = Field(min_length=8, max_length=128)
+
+    @validator("email")
+    def normalize_email_value(cls, value: str):
+        normalized = value.strip().lower()
+        if "@" not in normalized:
+            raise ValueError("Email must be valid.")
+        return normalized
+
+
+class UserLoginRequest(BaseModel):
+    """User login payload."""
+
+    email: str
+    password: str = Field(min_length=1, max_length=128)
+
+    @validator("email")
+    def normalize_email_value(cls, value: str):
+        normalized = value.strip().lower()
+        if "@" not in normalized:
+            raise ValueError("Email must be valid.")
+        return normalized
+
+
+class UserPublic(BaseModel):
+    """Public user payload."""
+
+    id: str
+    email: str
+    created_at: datetime
+
+
+class AuthTokenResponse(BaseModel):
+    """Access-token response payload."""
+
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user: UserPublic
+
+
+class AuthMessageResponse(BaseModel):
+    """Simple auth response message."""
+
+    message: str
