@@ -48,7 +48,12 @@ from app.core.schemas import (
 )
 from app.extraction.dynamic import DynamicExtractor
 from app.extraction.pii import PIIDetector
-from app.rag.engine import RAGEngine, RAG_PROMPT_K, RAG_RETRIEVE_K
+from app.rag.engine import (
+    MAX_QUESTION_CHARS,
+    RAGEngine,
+    RAG_PROMPT_K,
+    RAG_RETRIEVE_K,
+)
 from app.vectorization.engine import (
     DEFAULT_EMBEDDING_MODEL,
     VectorizationEngine,
@@ -220,34 +225,63 @@ def _question_with_conversation_context(question: str, history: List[Dict[str, s
     if not history:
         return question
 
+    question_text = question or ""
+    preamble = (
+        "Use the prior conversation context when relevant. "
+        "If history conflicts with retrieved legal context, prioritize retrieved context."
+    )
+    history_header = "Conversation History:\n"
+    question_header = "\n\nCurrent User Question:\n"
+    fixed_chars = (
+        len(preamble)
+        + 2  # \n\n between preamble and history header
+        + len(history_header)
+        + len(question_header)
+        + len(question_text)
+    )
+    history_budget = min(
+        CHAT_HISTORY_MAX_TOTAL_CHARS,
+        max(0, MAX_QUESTION_CHARS - fixed_chars),
+    )
+    if history_budget <= 0:
+        return question_text
+
     lines_reversed: List[str] = []
     consumed_chars = 0
     for message in reversed(history):
         prefix = "User" if message["role"] == "user" else "Assistant"
         line = f"{prefix}: {message['content']}"
         next_size = len(line) + (1 if lines_reversed else 0)
-        remaining = CHAT_HISTORY_MAX_TOTAL_CHARS - consumed_chars
+        remaining = history_budget - consumed_chars
         if remaining <= 0:
             break
         if next_size > remaining:
             if remaining > 64:
                 line = f"{line[: max(0, remaining - 4)].rstrip()}..."
                 lines_reversed.append(line)
-                consumed_chars = CHAT_HISTORY_MAX_TOTAL_CHARS
+                consumed_chars = history_budget
             break
         lines_reversed.append(line)
         consumed_chars += next_size
 
     lines = list(reversed(lines_reversed))
+    omission_marker = "[Earlier turns omitted due to prompt budget]"
     if len(lines) < len(history):
-        lines.insert(0, "[Earlier turns omitted due to prompt budget]")
+        candidate_lines = [omission_marker, *lines]
+        while lines and len("\n".join(candidate_lines)) > history_budget:
+            lines.pop(0)
+            candidate_lines = [omission_marker, *lines]
+        if len("\n".join(candidate_lines)) <= history_budget:
+            lines = candidate_lines
 
-    history_block = "\n".join(lines)
+    history_block = "\n".join(lines).strip()
+    if not history_block:
+        return question_text
+
     return (
-        "Use the prior conversation context when relevant. "
-        "If history conflicts with retrieved legal context, prioritize retrieved context.\n\n"
-        f"Conversation History:\n{history_block}\n\n"
-        f"Current User Question:\n{question}"
+        f"{preamble}\n\n"
+        f"{history_header}{history_block}"
+        f"{question_header}{question_text}"
     )
 
 
