@@ -4,6 +4,7 @@ import type {
   ChatEvent,
   ChatMessage,
   ChatSession,
+  ChatSessionSummary,
   ChatUsage,
   LLMProvider,
   PipelineStatusItem,
@@ -187,12 +188,51 @@ function createSession(provider: LLMProvider): ChatSession {
   };
 }
 
+function toSessionSummary(session: ChatSession): ChatSessionSummary {
+  return {
+    id: session.id,
+    title: session.title,
+    llmProvider: session.llmProvider,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+  };
+}
+
 function formatError(error: unknown, fallback: string): string {
   return error instanceof Error && error.message ? error.message : fallback;
 }
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError';
+}
+
+const PROVIDER_PREFERENCE_KEY = 'rag_provider_pref_v1';
+
+function isLlmProvider(value: string): value is LLMProvider {
+  return value === 'local' || value === 'openai' || value === 'anthropic' || value === 'google' || value === 'openrouter';
+}
+
+function readProviderPreference(userId: string): LLMProvider | null {
+  if (!userId || typeof localStorage === 'undefined') {
+    return null;
+  }
+  try {
+    const raw = localStorage.getItem(`${PROVIDER_PREFERENCE_KEY}:${userId}`);
+    return raw && isLlmProvider(raw) ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeProviderPreference(userId: string, provider: LLMProvider): void {
+  if (!userId || typeof localStorage === 'undefined') {
+    return;
+  }
+  try {
+    localStorage.setItem(`${PROVIDER_PREFERENCE_KEY}:${userId}`, provider);
+  } catch {
+    // Ignore storage failures.
+  }
 }
 
 export function ChatPage() {
@@ -203,8 +243,20 @@ export function ChatPage() {
   const [provider, setProvider] = useState<LLMProvider>('local');
   const [_composerError, setComposerError] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [isNewChatMode, setIsNewChatMode] = useState(false);
 
-  const sessionQuery = useChatSessionQuery(userId, selectedSessionId);
+  const persistedSessionIds = useMemo(
+    () => new Set((sessionsQuery.data ?? []).map((session) => session.id)),
+    [sessionsQuery.data],
+  );
+  const shouldFetchSelectedSession = Boolean(
+    selectedSessionId && persistedSessionIds.has(selectedSessionId),
+  );
+  const sessionQuery = useChatSessionQuery(
+    userId,
+    selectedSessionId,
+    shouldFetchSelectedSession,
+  );
   const saveSessionMutation = useSaveSessionMutation(userId);
   const sendMessageMutation = useSendMessageMutation();
   const deleteSessionMutation = useDeleteSessionMutation(userId);
@@ -219,18 +271,38 @@ export function ChatPage() {
   }, [state]);
 
   useEffect(() => {
+    const preferred = readProviderPreference(userId);
+    if (preferred) {
+      setProvider(preferred);
+    }
+  }, [userId]);
+
+  useEffect(() => {
+    if (isNewChatMode) {
+      return;
+    }
     if (!selectedSessionId && sessionsQuery.data?.length) {
       setSelectedSessionId(sessionsQuery.data[0].id);
     }
-  }, [selectedSessionId, sessionsQuery.data]);
+  }, [selectedSessionId, sessionsQuery.data, isNewChatMode]);
 
   useEffect(() => {
     if (!sessionQuery.data || state.streamingMessageId) {
       return;
     }
 
+    const currentSession = stateRef.current.session;
+    if (
+      currentSession &&
+      currentSession.id === sessionQuery.data.id &&
+      currentSession.updatedAt >= sessionQuery.data.updatedAt
+    ) {
+      return;
+    }
+
     dispatch({ type: 'set_session', session: sessionQuery.data });
     setProvider(sessionQuery.data.llmProvider);
+    setIsNewChatMode(false);
   }, [sessionQuery.data, state.streamingMessageId]);
 
   const sessions = useMemo(() => {
@@ -240,11 +312,17 @@ export function ChatPage() {
       return fromQuery;
     }
 
-    if (fromQuery.some((item) => item.id === local.id)) {
-      return fromQuery;
-    }
+    const localSummary = toSessionSummary(local);
+    const merged = fromQuery.some((item) => item.id === localSummary.id)
+      ? fromQuery.map((item) => {
+          if (item.id !== localSummary.id) {
+            return item;
+          }
+          return item.updatedAt >= localSummary.updatedAt ? item : localSummary;
+        })
+      : [localSummary, ...fromQuery];
 
-    return [local, ...fromQuery].sort((a, b) => b.updatedAt - a.updatedAt);
+    return merged.sort((a, b) => b.updatedAt - a.updatedAt);
   }, [sessionsQuery.data, state.session]);
 
   const isStreaming = Boolean(state.streamingMessageId) || sendMessageMutation.isPending;
@@ -298,7 +376,16 @@ export function ChatPage() {
     };
 
     setSelectedSessionId(nextSession.id);
+    setIsNewChatMode(false);
     dispatch({ type: 'start_stream', session: nextSession, assistantMessageId });
+    let streamState: ChatState = {
+      session: nextSession,
+      streamingMessageId: assistantMessageId,
+    };
+    const dispatchStreamAction = (action: ChatAction) => {
+      streamState = chatReducer(streamState, action);
+      dispatch(action);
+    };
 
     const request: RAGStreamRequest = {
       question: text,
@@ -308,6 +395,11 @@ export function ChatPage() {
       top_k: RAG_DEFAULT_TOP_K,
       temperature: 0.7,
       min_similarity: 0.2,
+      session_id: nextSession.id,
+      chat_history: startingSession.messages
+        .filter((message) => message.role === 'user' || message.role === 'assistant')
+        .map((message) => ({ role: message.role, content: message.content }))
+        .slice(-12),
     };
 
     const abortController = new AbortController();
@@ -321,7 +413,7 @@ export function ChatPage() {
         signal: abortController.signal,
         onEvent: (event: ChatEvent) => {
           if (event.type === 'status') {
-            dispatch({
+            dispatchStreamAction({
               type: 'add_status',
               messageId: assistantMessageId,
               status: {
@@ -333,18 +425,18 @@ export function ChatPage() {
           }
 
           if (event.type === 'token') {
-            dispatch({ type: 'append_token', messageId: assistantMessageId, token: event.data.text });
+            dispatchStreamAction({ type: 'append_token', messageId: assistantMessageId, token: event.data.text });
             return;
           }
 
           if (event.type === 'source') {
-            dispatch({ type: 'add_source', messageId: assistantMessageId, source: event.data });
+            dispatchStreamAction({ type: 'add_source', messageId: assistantMessageId, source: event.data });
             return;
           }
 
           if (event.type === 'final') {
-            dispatch({ type: 'apply_final', messageId: assistantMessageId, answer: event.data.answer });
-            dispatch({
+            dispatchStreamAction({ type: 'apply_final', messageId: assistantMessageId, answer: event.data.answer });
+            dispatchStreamAction({
               type: 'set_usage',
               messageId: assistantMessageId,
               usage: {
@@ -357,38 +449,48 @@ export function ChatPage() {
           }
 
           if (event.type === 'error') {
-            dispatch({ type: 'set_error', messageId: assistantMessageId, error: event.data.message });
+            dispatchStreamAction({ type: 'set_error', messageId: assistantMessageId, error: event.data.message });
             return;
           }
 
           if (event.type === 'done') {
             receivedDoneEvent = true;
-            dispatch({ type: 'complete', messageId: assistantMessageId });
+            dispatchStreamAction({ type: 'complete', messageId: assistantMessageId });
           }
         },
       });
 
       if (!receivedDoneEvent && !cancelRequestedRef.current) {
-        dispatch({
+        dispatchStreamAction({
           type: 'set_error',
           messageId: assistantMessageId,
           error: 'The stream ended unexpectedly before completion.',
         });
-        dispatch({ type: 'complete', messageId: assistantMessageId });
+        dispatchStreamAction({ type: 'complete', messageId: assistantMessageId });
       }
     } catch (error) {
       if (!cancelRequestedRef.current && !isAbortError(error)) {
         const message = formatError(error, 'Unable to get a response from the RAG service.');
-        dispatch({ type: 'set_error', messageId: assistantMessageId, error: message });
-        dispatch({ type: 'complete', messageId: assistantMessageId });
+        dispatchStreamAction({ type: 'set_error', messageId: assistantMessageId, error: message });
+        dispatchStreamAction({ type: 'complete', messageId: assistantMessageId });
         setComposerError(message);
       }
     } finally {
+      const wasCancelled = cancelRequestedRef.current;
+      if (wasCancelled) {
+        streamState = chatReducer(streamState, {
+          type: 'set_error',
+          messageId: assistantMessageId,
+          error: 'Generation canceled by user.',
+        });
+        streamState = chatReducer(streamState, { type: 'complete', messageId: assistantMessageId });
+      }
+
       abortControllerRef.current = null;
       cancelRequestedRef.current = false;
 
-      if (stateRef.current.session) {
-        await persistSession(stateRef.current.session);
+      if (streamState.session) {
+        await persistSession(streamState.session);
       }
     }
   };
@@ -411,9 +513,13 @@ export function ChatPage() {
   };
 
   const onNewChat = () => {
+    const preferred = readProviderPreference(userId);
+    if (preferred) {
+      setProvider(preferred);
+    }
     setSelectedSessionId(null);
+    setIsNewChatMode(true);
     dispatch({ type: 'reset' });
-    setProvider('local');
     setComposerError(null);
   };
 
@@ -431,7 +537,9 @@ export function ChatPage() {
         setSelectedSessionId(nextSession?.id ?? null);
         if (!nextSession) {
           dispatch({ type: 'reset' });
-          setProvider('local');
+          setIsNewChatMode(true);
+        } else {
+          setIsNewChatMode(false);
         }
       }
     } catch (error) {
@@ -463,6 +571,7 @@ export function ChatPage() {
           }}
           onSelectSession={(id) => {
             setSelectedSessionId(id);
+            setIsNewChatMode(false);
             setIsSidebarOpen(false);
           }}
           onDeleteSession={onDeleteSession}
@@ -490,7 +599,11 @@ export function ChatPage() {
               <div className="flex items-center gap-2 mt-1">
                 <select
                   value={provider}
-                  onChange={(e) => setProvider(e.target.value as LLMProvider)}
+                  onChange={(e) => {
+                    const nextProvider = e.target.value as LLMProvider;
+                    setProvider(nextProvider);
+                    writeProviderPreference(userId, nextProvider);
+                  }}
                   className="bg-slate-900/50 border border-slate-800 text-xs text-slate-400 rounded-md px-2 py-1 outline-none focus:border-slate-600 focus:text-slate-200 transition-colors cursor-pointer"
                 >
                   <option value="local">Local Model</option>

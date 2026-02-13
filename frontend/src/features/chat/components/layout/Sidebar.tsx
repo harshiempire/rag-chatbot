@@ -3,10 +3,10 @@ import { LogOut, MessageSquare, Plus, Trash2 } from "lucide-react";
 import { format, isToday, isYesterday } from "date-fns";
 import { cn } from "../../../../shared/utils/cn";
 import { Button } from "../ui/Button";
-import type { ChatSession } from "../../../../shared/types/chat";
+import type { ChatSessionSummary } from "../../../../shared/types/chat";
 
 interface SidebarProps {
-    sessions: ChatSession[];
+    sessions: ChatSessionSummary[];
     selectedSessionId: string | null;
     userEmail: string;
     onLogout: () => void;
@@ -44,7 +44,7 @@ export function Sidebar({
         }
         groups[key].push(session);
         return groups;
-    }, {} as Record<string, ChatSession[]>);
+    }, {} as Record<string, ChatSessionSummary[]>);
 
     const groups = ["Today", "Yesterday", ...Object.keys(groupedSessions).filter(k => k !== "Today" && k !== "Yesterday")];
 

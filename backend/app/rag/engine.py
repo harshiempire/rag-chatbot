@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import anthropic
 import openai
@@ -18,6 +18,7 @@ import requests
 from fastapi import HTTPException
 from google import genai
 
+from app.config import RAG_MAX_QUESTION_CHARS
 from app.core.database import VectorDatabase
 from app.core.enums import DataClassification, LLMProvider
 from app.core.schemas import RAGQuery, RAGResponse
@@ -30,6 +31,9 @@ RAG_RETRIEVE_K = int(os.getenv("RAG_RETRIEVE_K", "8"))
 RAG_PROMPT_K = int(os.getenv("RAG_PROMPT_K", "3"))
 MAX_CHUNK_CHARS = int(os.getenv("RAG_MAX_CHUNK_CHARS", "1200"))
 MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "6000"))
+MAX_PROMPT_CHARS = int(os.getenv("RAG_MAX_PROMPT_CHARS", "10000"))
+MAX_QUESTION_CHARS = RAG_MAX_QUESTION_CHARS
+PROMPT_SCAFFOLD_CHARS = int(os.getenv("RAG_PROMPT_SCAFFOLD_CHARS", "900"))
 RAG_MIN_DISTINCT_SECTIONS = int(os.getenv("RAG_MIN_DISTINCT_SECTIONS", "2"))
 
 
@@ -53,7 +57,9 @@ class RAGEngine:
         else:
             self.gemini_client = None
 
-    def query(self, rag_query: RAGQuery, user_id: str) -> RAGResponse:
+    def query(
+        self, rag_query: RAGQuery, user_id: str, prompt_question: Optional[str] = None
+    ) -> RAGResponse:
         """Execute RAG query with security"""
         total_start = time.perf_counter()
         timings_ms: Dict[str, float] = {}
@@ -85,7 +91,8 @@ class RAGEngine:
         max_class = self._get_max_classification([r["classification"] for r in results])
 
         prompt_start = time.perf_counter()
-        prompt, prompt_context_count = self._build_prompt(rag_query.question, results)
+        prompt_input = prompt_question or rag_query.question
+        prompt, prompt_context_count = self._build_prompt(prompt_input, results)
         timings_ms["prompt_build"] = round(
             (time.perf_counter() - prompt_start) * 1000, 2
         )
@@ -185,6 +192,15 @@ class RAGEngine:
         self, question: str, context_chunks: List[Dict]
     ) -> tuple[str, int]:
         """Build the RAG prompt from context chunks"""
+        question_text = (question or "").strip()
+        if len(question_text) > MAX_QUESTION_CHARS:
+            question_text = f"{question_text[: MAX_QUESTION_CHARS - 3].rstrip()}..."
+
+        context_budget = min(
+            MAX_CONTEXT_CHARS,
+            max(1200, MAX_PROMPT_CHARS - len(question_text) - PROMPT_SCAFFOLD_CHARS),
+        )
+
         chunks = context_chunks[: min(len(context_chunks), RAG_PROMPT_K)]
         parts = []
         section_keys = set()
@@ -220,8 +236,8 @@ class RAGEngine:
                 "; ".join(metadata_items) if metadata_items else "metadata=none"
             )
             block = f"[Source {i + 1}]\nMetadata: {metadata_line}\n{text}"
-            if total + len(block) > MAX_CONTEXT_CHARS:
-                remaining = max(0, MAX_CONTEXT_CHARS - total)
+            if total + len(block) > context_budget:
+                remaining = max(0, context_budget - total)
                 if remaining > 200:
                     parts.append(block[:remaining])
                     used += 1
@@ -259,9 +275,28 @@ Context:
 {context}
 {coverage_note}
 
-Question: {question}
+Question: {question_text}
 
 Provide a detailed answer based only on the information above. If you don't know, say so."""
+
+        if len(prompt) > MAX_PROMPT_CHARS:
+            suffix = "\n...[context truncated for prompt budget]"
+            overflow = len(prompt) - MAX_PROMPT_CHARS + len(suffix)
+            trimmed_context = context[: max(0, len(context) - overflow)].rstrip()
+            if trimmed_context and len(trimmed_context) < len(context):
+                trimmed_context = f"{trimmed_context}{suffix}"
+            prompt = f"""Based on the regulatory documents below, answer the question.
+
+Context:
+{trimmed_context}
+{coverage_note}
+
+Question: {question_text}
+
+Provide a detailed answer based only on the information above. If you don't know, say so."""
+        if len(prompt) > MAX_PROMPT_CHARS:
+            # Final guard in case config values drift and prompt scaffolding exceeds expected bounds.
+            prompt = prompt[:MAX_PROMPT_CHARS].rstrip()
         return prompt, used
 
     def _generate_answer(self, query: RAGQuery, prompt: str) -> str:

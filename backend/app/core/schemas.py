@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, validator
 
+from app.config import RAG_MAX_QUESTION_CHARS
 from app.core.enums import (
     AuthType,
     ChunkingStrategy,
@@ -114,13 +115,15 @@ class ReviewDecision(BaseModel):
 
 class RAGQuery(BaseModel):
     """RAG query request"""
-    question: str
+    question: str = Field(max_length=RAG_MAX_QUESTION_CHARS)
     llm_provider: LLMProvider
     classification_filter: Optional[List[DataClassification]] = None
     source_id: Optional[str] = None
     top_k: int = 5
     temperature: float = 0.7
     min_similarity: float = 0.2
+    session_id: Optional[str] = None
+    chat_history: Optional[List[Dict[str, str]]] = None
 
 
 class RAGResponse(BaseModel):
@@ -184,3 +187,31 @@ class AuthMessageResponse(BaseModel):
     """Simple auth response message."""
 
     message: str
+
+
+class ChatHistoryTurn(BaseModel):
+    """Conversation turn used for context."""
+
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ChatSessionSummaryPayload(BaseModel):
+    """Persisted chat session metadata."""
+
+    id: str
+    title: str
+    llmProvider: LLMProvider
+    createdAt: int
+    updatedAt: int
+
+
+class ChatSessionPayload(BaseModel):
+    """Persisted chat session payload."""
+
+    id: str
+    title: str
+    llmProvider: LLMProvider
+    createdAt: int
+    updatedAt: int
+    messages: List[Dict[str, Any]] = Field(default_factory=list)

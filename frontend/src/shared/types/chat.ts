@@ -81,6 +81,13 @@ export interface RAGStreamRequest {
   top_k: number;
   temperature: number;
   min_similarity: number;
+  session_id?: string;
+  chat_history?: ChatHistoryTurn[];
+}
+
+export interface ChatHistoryTurn {
+  role: 'user' | 'assistant';
+  content: string;
 }
 
 export interface ChatMessage {
@@ -102,4 +109,12 @@ export interface ChatSession {
   createdAt: number;
   updatedAt: number;
   messages: ChatMessage[];
+}
+
+export interface ChatSessionSummary {
+  id: string;
+  title: string;
+  llmProvider: LLMProvider;
+  createdAt: number;
+  updatedAt: number;
 }
