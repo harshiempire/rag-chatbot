@@ -560,34 +560,50 @@ class VectorDatabase:
             "updatedAt": int(row[4]),
         }
 
-    def list_chat_sessions(self, user_id: str) -> List[Dict[str, Any]]:
+    def list_chat_sessions(
+        self, user_id: str, limit: Optional[int] = None, offset: int = 0
+    ) -> List[Dict[str, Any]]:
         with self.get_connection() as conn:
             cur = conn.cursor()
-            cur.execute(
-                """
+            query = """
                 SELECT id, user_id, title, llm_provider, created_at, updated_at, messages
                 FROM chat_sessions
                 WHERE user_id = %s
                 ORDER BY updated_at DESC
-                """,
-                (user_id,),
-            )
+                """
+            params: List[Any] = [user_id]
+            if limit is not None:
+                query += " LIMIT %s"
+                params.append(limit)
+            if offset > 0:
+                query += " OFFSET %s"
+                params.append(offset)
+
+            cur.execute(query, tuple(params))
             rows = cur.fetchall()
             cur.close()
             return [self._map_chat_session_row(row) for row in rows]
 
-    def list_chat_session_summaries(self, user_id: str) -> List[Dict[str, Any]]:
+    def list_chat_session_summaries(
+        self, user_id: str, limit: Optional[int] = None, offset: int = 0
+    ) -> List[Dict[str, Any]]:
         with self.get_connection() as conn:
             cur = conn.cursor()
-            cur.execute(
-                """
+            query = """
                 SELECT id, title, llm_provider, created_at, updated_at
                 FROM chat_sessions
                 WHERE user_id = %s
                 ORDER BY updated_at DESC
-                """,
-                (user_id,),
-            )
+                """
+            params: List[Any] = [user_id]
+            if limit is not None:
+                query += " LIMIT %s"
+                params.append(limit)
+            if offset > 0:
+                query += " OFFSET %s"
+                params.append(offset)
+
+            cur.execute(query, tuple(params))
             rows = cur.fetchall()
             cur.close()
             return [self._map_chat_session_summary_row(row) for row in rows]

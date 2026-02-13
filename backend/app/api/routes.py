@@ -10,9 +10,9 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
-from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 
 from app.config import (
@@ -86,7 +86,18 @@ CHAT_SESSION_MAX_MESSAGE_CONTENT_CHARS = int(
 CHAT_SESSION_MAX_PAYLOAD_BYTES = int(
     os.getenv("CHAT_SESSION_MAX_PAYLOAD_BYTES", "1048576")
 )
+CHAT_SESSION_ID_MAX_CHARS = int(os.getenv("CHAT_SESSION_ID_MAX_CHARS", "128"))
+CHAT_SESSION_TITLE_MAX_CHARS = int(os.getenv("CHAT_SESSION_TITLE_MAX_CHARS", "200"))
+CHAT_SESSION_LIST_MAX_LIMIT = int(os.getenv("CHAT_SESSION_LIST_MAX_LIMIT", "500"))
+CHAT_SESSION_SUMMARY_DEFAULT_LIMIT = int(
+    os.getenv("CHAT_SESSION_SUMMARY_DEFAULT_LIMIT", "200")
+)
 RESERVED_CHAT_SESSION_IDS = {"summary"}
+
+LEGAL_ROUTER_HISTORY_TURNS = int(os.getenv("LEGAL_ROUTER_HISTORY_TURNS", "4"))
+LEGAL_ROUTER_HISTORY_CHARS_PER_TURN = int(
+    os.getenv("LEGAL_ROUTER_HISTORY_CHARS_PER_TURN", "320")
+)
 
 
 def _validate_chat_session_id(session_id: str) -> None:
@@ -95,6 +106,258 @@ def _validate_chat_session_id(session_id: str) -> None:
             status_code=400,
             detail=f"Session id '{session_id}' is reserved and cannot be used.",
         )
+
+
+def _extract_json_object(raw: str) -> Dict[str, Any] | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    for idx in range(start, len(text)):
+        char = text[idx]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start : idx + 1]
+                try:
+                    parsed = json.loads(candidate)
+                    return parsed if isinstance(parsed, dict) else None
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def _format_router_history(history: List[Dict[str, str]]) -> str:
+    selected = history[-LEGAL_ROUTER_HISTORY_TURNS :]
+    if not selected:
+        return "none"
+
+    lines: List[str] = []
+    for turn in selected:
+        role = "user" if turn.get("role") == "user" else "assistant"
+        content = (turn.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(
+            f"{role}: {content[:LEGAL_ROUTER_HISTORY_CHARS_PER_TURN]}"
+        )
+    return "\n".join(lines) if lines else "none"
+
+
+def _decide_query_mode_with_llm(
+    engine: RAGEngine, query: RAGQuery, history: List[Dict[str, str]]
+) -> Tuple[str, str]:
+    router_prompt = (
+        "You are a routing controller for an eCFR legal assistant.\n"
+        "Choose exactly one mode for this request:\n"
+        "- rag: use retrieval over legal/regulatory documents.\n"
+        "- direct: no retrieval needed (greeting/chit-chat/meta/capabilities).\n"
+        "- deny: refuse unsafe or disallowed requests.\n\n"
+        "Policy:\n"
+        "- This assistant provides legal information, not legal advice.\n"
+        "- Use rag for legal interpretation, compliance, citations, or document-grounded follow-ups.\n"
+        "- Use direct for social talk and capability/boundary clarification.\n"
+        "- Use deny for requests enabling wrongdoing or for personalized legal advice that should be handled by a licensed attorney.\n"
+        "- If uncertain, choose rag.\n\n"
+        "Output STRICT JSON only:\n"
+        '{"mode":"rag|direct|deny","reason":"short reason"}\n\n'
+        f"User question:\n{query.question.strip()}\n\n"
+        f"Recent conversation:\n{_format_router_history(history)}"
+    )
+
+    decision_query = query.model_copy(update={"temperature": 0.0})
+    try:
+        raw = engine._generate_answer(decision_query, router_prompt)
+    except Exception as exc:
+        logger.warning(f"Router decision failed, defaulting to rag: {exc}")
+        return "rag", "router_error"
+
+    parsed = _extract_json_object(raw)
+    if not parsed:
+        logger.warning("Router returned non-JSON output, defaulting to rag")
+        return "rag", "router_parse_error"
+
+    mode = str(parsed.get("mode", "rag")).strip().lower()
+    if mode not in {"rag", "direct", "deny"}:
+        mode = "rag"
+    reason = str(parsed.get("reason", "")).strip()[:240]
+    return mode, reason
+
+
+def _build_non_rag_prompt(question: str, mode: str, reason: str) -> str:
+    mode_instruction = (
+        "Respond helpfully and briefly to the user."
+        if mode == "direct"
+        else (
+            "Politely refuse the request and explain the boundary. "
+            "Offer a safe legal-information alternative."
+        )
+    )
+    return (
+        "You are an eCFR legal assistant.\n"
+        "Capabilities:\n"
+        "- Help users understand legal/regulatory topics and answer document-grounded legal questions.\n"
+        "- Explain what the assistant can and cannot do.\n\n"
+        "Boundaries:\n"
+        "- Do not provide personalized legal advice or representation.\n"
+        "- Do not help with wrongdoing or evasion.\n"
+        "- Be transparent about limits and suggest asking a licensed attorney when appropriate.\n\n"
+        f"Routing decision: {mode}\n"
+        f"Routing reason: {reason or 'n/a'}\n\n"
+        f"{mode_instruction}\n\n"
+        f"User message:\n{question.strip()}"
+    )
+
+
+def _empty_rag_response(answer: str, llm_provider: LLMProvider, llm_ms: float = 0.0) -> RAGResponse:
+    total_ms = round(llm_ms, 2)
+    return RAGResponse(
+        answer=answer,
+        sources=[],
+        classification=DataClassification.PUBLIC,
+        llm_provider=llm_provider,
+        retrieved_count=0,
+        prompt_context_count=0,
+        total_ms=total_ms,
+        timings_ms={
+            "embed": 0.0,
+            "search": 0.0,
+            "prompt_build": 0.0,
+            "llm": round(llm_ms, 2),
+            "total": total_ms,
+        },
+    )
+
+
+def _log_non_rag_query(
+    engine: RAGEngine,
+    user_id: str,
+    query: RAGQuery,
+    mode: str,
+    reason: str,
+    llm_ms: float = 0.0,
+) -> None:
+    try:
+        engine.vector_db.log_query(
+            user_id,
+            query.question,
+            query.llm_provider.value,
+            DataClassification.PUBLIC.value,
+            True,
+            details={
+                "route_mode": mode,
+                "route_reason": reason,
+                "retrieved_count": 0,
+                "prompt_context_count": 0,
+                "source_id": query.source_id,
+                "timings_ms": {
+                    "embed": 0.0,
+                    "search": 0.0,
+                    "prompt_build": 0.0,
+                    "llm": round(llm_ms, 2),
+                    "total": round(llm_ms, 2),
+                },
+                "prompt_k": RAG_PROMPT_K,
+                "retrieve_k": 0,
+            },
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to log non-RAG query: {exc}")
+
+
+def _stream_from_provider(engine: RAGEngine, query: RAGQuery, prompt: str):
+    if query.llm_provider == LLMProvider.LOCAL:
+        return engine._ollama_stream(prompt)
+    if query.llm_provider == LLMProvider.OPENROUTER:
+        return engine._openrouter_stream(prompt, temperature=query.temperature)
+    raise HTTPException(
+        status_code=400,
+        detail=f"Streaming not supported for provider {query.llm_provider.value}.",
+    )
+
+
+def _streaming_non_rag_response(engine: RAGEngine, query: RAGQuery, prompt: str) -> StreamingResponse:
+    return StreamingResponse(_stream_from_provider(engine, query, prompt), media_type="text/plain")
+
+
+def _sse_non_rag_response(
+    engine: RAGEngine, query: RAGQuery, prompt: str, user_id: str, mode: str, reason: str
+) -> StreamingResponse:
+    def event_generator():
+        total_start = time.perf_counter()
+        answer_parts: List[str] = []
+        try:
+            yield _sse_event(
+                "status",
+                {
+                    "stage": "generation",
+                    "state": "start",
+                    "label": "Generating response",
+                },
+            )
+            stream_iter = _stream_from_provider(engine, query, prompt)
+            error_code = (
+                "LOCAL_LLM_ERROR"
+                if query.llm_provider == LLMProvider.LOCAL
+                else "OPENROUTER_STREAM_ERROR"
+            )
+            for token in stream_iter:
+                if token and token.lstrip().startswith("[Error]"):
+                    yield _sse_event("error", {"code": error_code, "message": token.strip()})
+                    yield _sse_event("done", {})
+                    return
+                if token:
+                    answer_parts.append(token)
+                    yield _sse_event("token", {"text": token})
+
+            llm_ms = round((time.perf_counter() - total_start) * 1000, 2)
+            answer = "".join(answer_parts).strip()
+            _log_non_rag_query(engine, user_id, query, mode, reason, llm_ms=llm_ms)
+            yield _sse_event(
+                "status",
+                {
+                    "stage": "generation",
+                    "state": "done",
+                    "label": "Generation complete",
+                    "meta": {"duration_ms": llm_ms},
+                },
+            )
+            yield _sse_event(
+                "final",
+                {
+                    "answer": answer,
+                    "timings_ms": {
+                        "embed": 0.0,
+                        "search": 0.0,
+                        "prompt_build": 0.0,
+                        "llm": llm_ms,
+                        "total": llm_ms,
+                    },
+                    "retrieved_count": 0,
+                    "prompt_context_count": 0,
+                },
+            )
+            yield _sse_event("done", {})
+        except Exception as exc:
+            logger.error(f"❌ Non-RAG SSE stream failed: {exc}")
+            yield _sse_event("error", {"code": "STREAM_FAILURE", "message": str(exc)})
+            yield _sse_event("done", {})
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    return None
 
 
 def _sse_event(event_type: str, data: Dict[str, Any]) -> str:
@@ -250,6 +513,23 @@ def _resolve_history_for_query(
 
 
 def _enforce_chat_session_limits(payload: ChatSessionPayload) -> None:
+    if len(payload.id) > CHAT_SESSION_ID_MAX_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Session id length is {len(payload.id)}; "
+                f"maximum allowed is {CHAT_SESSION_ID_MAX_CHARS}."
+            ),
+        )
+    if len(payload.title) > CHAT_SESSION_TITLE_MAX_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Session title length is {len(payload.title)}; "
+                f"maximum allowed is {CHAT_SESSION_TITLE_MAX_CHARS}."
+            ),
+        )
+
     messages = payload.messages or []
     if len(messages) > CHAT_SESSION_MAX_MESSAGES:
         raise HTTPException(
@@ -468,17 +748,31 @@ async def get_me(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 
 @router.get("/chat/sessions", response_model=List[ChatSessionPayload])
-async def list_chat_sessions(current_user: Dict[str, Any] = Depends(get_current_user)):
+async def list_chat_sessions(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    limit: int | None = Query(default=None, ge=1, le=CHAT_SESSION_LIST_MAX_LIMIT),
+    offset: int = Query(default=0, ge=0),
+):
     """List chat sessions for the authenticated user."""
-    return get_vector_db().list_chat_sessions(str(current_user["id"]))
+    return get_vector_db().list_chat_sessions(
+        str(current_user["id"]), limit=limit, offset=offset
+    )
 
 
 @router.get("/chat/sessions/summary", response_model=List[ChatSessionSummaryPayload])
 async def list_chat_session_summaries(
     current_user: Dict[str, Any] = Depends(get_current_user),
+    limit: int = Query(
+        default=CHAT_SESSION_SUMMARY_DEFAULT_LIMIT,
+        ge=1,
+        le=CHAT_SESSION_LIST_MAX_LIMIT,
+    ),
+    offset: int = Query(default=0, ge=0),
 ):
     """List chat session metadata for the authenticated user."""
-    return get_vector_db().list_chat_session_summaries(str(current_user["id"]))
+    return get_vector_db().list_chat_session_summaries(
+        str(current_user["id"]), limit=limit, offset=offset
+    )
 
 
 @router.get("/chat/sessions/{session_id}", response_model=ChatSessionPayload)
@@ -774,13 +1068,25 @@ async def rag_query_endpoint(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Query RAG system with security controls"""
+    engine = get_rag_engine()
+    classifications = query.classification_filter or [DataClassification.PUBLIC]
+    engine._validate_llm_access(query.llm_provider, classifications)
+
     user_id = str(current_user["id"])
     history = _resolve_history_for_query(query, current_user)
     prompt_question = _question_with_conversation_context(query.question, history)
-    try:
-        response = get_rag_engine().query(
-            query, user_id, prompt_question=prompt_question
+    route_mode, route_reason = _decide_query_mode_with_llm(engine, query, history)
+    if route_mode in {"direct", "deny"}:
+        llm_start = time.perf_counter()
+        non_rag_prompt = _build_non_rag_prompt(query.question, route_mode, route_reason)
+        answer = engine._generate_answer(query, non_rag_prompt)
+        llm_ms = round((time.perf_counter() - llm_start) * 1000, 2)
+        _log_non_rag_query(
+            engine, user_id, query, route_mode, route_reason, llm_ms=llm_ms
         )
+        return _empty_rag_response(answer, query.llm_provider, llm_ms=llm_ms)
+    try:
+        response = engine.query(query, user_id, prompt_question=prompt_question)
         logger.info(f"✅ RAG query by {user_id}: {query.question[:50]}...")
         return response
     except HTTPException as e:
@@ -810,6 +1116,11 @@ async def rag_query_stream_endpoint(
 
     classifications = query.classification_filter or [DataClassification.PUBLIC]
     engine._validate_llm_access(query.llm_provider, classifications)
+    route_mode, route_reason = _decide_query_mode_with_llm(engine, query, history)
+    if route_mode in {"direct", "deny"}:
+        non_rag_prompt = _build_non_rag_prompt(query.question, route_mode, route_reason)
+        _log_non_rag_query(engine, user_id, query, route_mode, route_reason, llm_ms=0.0)
+        return _streaming_non_rag_response(engine, query, non_rag_prompt)
 
     if engine.vectorization is None:
         engine.vectorization = VectorizationEngine(DEFAULT_EMBEDDING_MODEL)
@@ -881,6 +1192,12 @@ async def rag_query_stream_events_endpoint(
     prompt_question = _question_with_conversation_context(query.question, history)
     classifications = query.classification_filter or [DataClassification.PUBLIC]
     engine._validate_llm_access(query.llm_provider, classifications)
+    route_mode, route_reason = _decide_query_mode_with_llm(engine, query, history)
+    if route_mode in {"direct", "deny"}:
+        non_rag_prompt = _build_non_rag_prompt(query.question, route_mode, route_reason)
+        return _sse_non_rag_response(
+            engine, query, non_rag_prompt, user_id, route_mode, route_reason
+        )
 
     def event_generator():
         total_start = time.perf_counter()

@@ -34,7 +34,7 @@ async function parseResponse<T>(response: Response): Promise<T> {
 
 export class ApiHistoryStore implements ChatHistoryStore {
   async listSessions(_userId: string): Promise<ChatSessionSummary[]> {
-    const response = await authorizedFetch(`${API_BASE_URL}/chat/sessions/summary`, {
+    const response = await authorizedFetch(`${API_BASE_URL}/chat/sessions/summary?limit=200`, {
       method: 'GET',
     });
     return parseResponse<ChatSessionSummary[]>(response);
