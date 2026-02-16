@@ -4,7 +4,7 @@ import type { ChatEvent } from '../types/chat';
 const statusEventSchema = z.object({
   type: z.literal('status'),
   data: z.object({
-    stage: z.enum(['embedding', 'retrieval', 'prompt_build', 'generation']),
+    stage: z.enum(['routing', 'embedding', 'retrieval', 'prompt_build', 'generation']),
     state: z.enum(['start', 'done']),
     label: z.string(),
     meta: z.any().optional(),

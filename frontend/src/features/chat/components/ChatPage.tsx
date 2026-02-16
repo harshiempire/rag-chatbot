@@ -235,6 +235,133 @@ function writeProviderPreference(userId: string, provider: LLMProvider): void {
   }
 }
 
+const FOLLOWUP_REFERENCE_PATTERN =
+  /\b(same|that|this|these|those|it|they|them|under the same|same section|same rule)\b/i;
+const EXPLICIT_LEGAL_REFERENCE_PATTERN =
+  /(§\s*\d+[\w.-]*|\bpart\s+\d+[a-z]?\b|\btitle\s+\d+\b|\b\d+\s*cfr\b)/i;
+
+function asTrimmedString(value: unknown): string | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const text = value.trim();
+  return text.length > 0 ? text : null;
+}
+
+function parseRefFromText(text: string, key: string): string | null {
+  const value = text.trim();
+  if (!value) {
+    return null;
+  }
+  if (key === 'section') {
+    const match = value.match(/§\s*([\d.]+[a-z]?)/i);
+    return match?.[1]?.toLowerCase() ?? null;
+  }
+  if (key === 'part') {
+    const sectionMatch = value.match(/§\s*([\d]+)\./i);
+    if (sectionMatch?.[1]) return sectionMatch[1].toLowerCase();
+    const partMatch = value.match(/\bpart\s+(\d+[a-z]?)\b/i);
+    return partMatch?.[1]?.toLowerCase() ?? null;
+  }
+  if (key === 'chapter') {
+    const match = value.match(/\bchapter\s+([ivxlcdm]+|\d+)\b/i);
+    return match?.[1]?.toUpperCase() ?? null;
+  }
+  if (key === 'title') {
+    const match = value.match(/\btitle\s+(\d+)\b/i);
+    return match?.[1] ?? null;
+  }
+  return null;
+}
+
+function getSourceReferenceValue(
+  source: NonNullable<ChatMessage['sources']>[number],
+  key: string
+): string | null {
+  const metadata = source.metadata as Record<string, unknown> | undefined;
+  if (!metadata || typeof metadata !== 'object') {
+    return null;
+  }
+  const chunkMetadata = metadata.chunk_metadata as Record<string, unknown> | undefined;
+  const docMetadata = metadata.doc_metadata as Record<string, unknown> | undefined;
+  const directValue =
+    asTrimmedString(chunkMetadata?.[key]) ??
+    asTrimmedString(docMetadata?.[key]) ??
+    asTrimmedString(metadata[key]);
+  if (directValue) {
+    return directValue;
+  }
+
+  const fromTitle = parseRefFromText(source.title ?? '', key);
+  if (fromTitle) {
+    return fromTitle;
+  }
+  return parseRefFromText(source.snippet ?? '', key);
+}
+
+function topKeyByCount(counter: Map<string, number>): string | null {
+  let winner: string | null = null;
+  let maxCount = 0;
+  for (const [key, count] of counter.entries()) {
+    if (count > maxCount) {
+      winner = key;
+      maxCount = count;
+    }
+  }
+  return winner;
+}
+
+function inferFollowupMetadataFilters(
+  question: string,
+  messages: ChatMessage[]
+): Record<string, string | string[]> | undefined {
+  if (EXPLICIT_LEGAL_REFERENCE_PATTERN.test(question)) {
+    return undefined;
+  }
+  if (!FOLLOWUP_REFERENCE_PATTERN.test(question)) {
+    return undefined;
+  }
+
+  const latestAssistantWithSources = [...messages]
+    .reverse()
+    .find((message) => message.role === 'assistant' && (message.sources?.length ?? 0) > 0);
+  if (!latestAssistantWithSources?.sources?.length) {
+    return undefined;
+  }
+
+  const partCounts = new Map<string, number>();
+  const sectionCounts = new Map<string, number>();
+  const chapterCounts = new Map<string, number>();
+  const titleCounts = new Map<string, number>();
+
+  for (const source of latestAssistantWithSources.sources) {
+    const part = getSourceReferenceValue(source, 'part');
+    const section = getSourceReferenceValue(source, 'section');
+    const chapter = getSourceReferenceValue(source, 'chapter');
+    const title = getSourceReferenceValue(source, 'title');
+    if (part) partCounts.set(part, (partCounts.get(part) ?? 0) + 1);
+    if (section) sectionCounts.set(section, (sectionCounts.get(section) ?? 0) + 1);
+    if (chapter) chapterCounts.set(chapter, (chapterCounts.get(chapter) ?? 0) + 1);
+    if (title) titleCounts.set(title, (titleCounts.get(title) ?? 0) + 1);
+  }
+
+  const inferred: Record<string, string | string[]> = {};
+  const section = topKeyByCount(sectionCounts);
+  const part = topKeyByCount(partCounts);
+  const chapter = topKeyByCount(chapterCounts);
+  const title = topKeyByCount(titleCounts);
+
+  if (section) inferred.section = section;
+  if (part) inferred.part = part;
+  if (chapter) inferred.chapter = chapter;
+  if (title) inferred.title = title;
+
+  return Object.keys(inferred).length > 0 ? inferred : undefined;
+}
+
 export function ChatPage() {
   const { user, logout } = useAuth();
   const userId = user?.id ?? '';
@@ -400,6 +527,13 @@ export function ChatPage() {
         .filter((message) => message.role === 'user' || message.role === 'assistant')
         .map((message) => ({ role: message.role, content: message.content }))
         .slice(-12),
+      conversation_context: startingSession.messages
+        .filter((message) => message.role === 'user')
+        .map((message) => message.content.trim())
+        .filter(Boolean)
+        .slice(-2),
+      metadata_filters: inferFollowupMetadataFilters(text, startingSession.messages),
+      retrieval_mode: 'hybrid',
     };
 
     const abortController = new AbortController();

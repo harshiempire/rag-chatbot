@@ -1,7 +1,7 @@
 export type LLMProvider = 'openai' | 'anthropic' | 'google' | 'openrouter' | 'local';
 export type DataClassification = 'public' | 'internal' | 'confidential' | 'restricted';
 
-export type PipelineStage = 'embedding' | 'retrieval' | 'prompt_build' | 'generation';
+export type PipelineStage = 'routing' | 'embedding' | 'retrieval' | 'prompt_build' | 'generation';
 export type PipelineState = 'start' | 'done';
 
 export interface PipelineStatusItem {
@@ -83,6 +83,9 @@ export interface RAGStreamRequest {
   min_similarity: number;
   session_id?: string;
   chat_history?: ChatHistoryTurn[];
+  conversation_context?: string[];
+  metadata_filters?: Record<string, string | string[]>;
+  retrieval_mode?: 'dense' | 'hybrid';
 }
 
 export interface ChatHistoryTurn {

@@ -45,7 +45,10 @@ class RAGEngine:
         self.vectorization = None
 
         # Initialize LLM clients
-        openai.api_key = os.getenv("OPENAI_API_KEY")
+        self.openai_key = os.getenv("OPENAI_API_KEY")
+        self.openai_client = (
+            openai.OpenAI(api_key=self.openai_key) if self.openai_key else None
+        )
         self.anthropic_client = anthropic.Anthropic(
             api_key=os.getenv("ANTHROPIC_API_KEY")
         )
@@ -58,7 +61,11 @@ class RAGEngine:
             self.gemini_client = None
 
     def query(
-        self, rag_query: RAGQuery, user_id: str, prompt_question: Optional[str] = None
+        self,
+        rag_query: RAGQuery,
+        user_id: str,
+        prompt_question: Optional[str] = None,
+        retrieval_question: Optional[str] = None,
     ) -> RAGResponse:
         """Execute RAG query with security"""
         total_start = time.perf_counter()
@@ -68,8 +75,9 @@ class RAGEngine:
         classifications = rag_query.classification_filter or [DataClassification.PUBLIC]
         self._validate_llm_access(rag_query.llm_provider, classifications)
 
+        retrieval_question_text = (retrieval_question or rag_query.question).strip()
         embed_start = time.perf_counter()
-        query_embedding = self.get_query_embedding(rag_query.question)
+        query_embedding = self.get_query_embedding(retrieval_question_text)
         timings_ms["embed"] = round((time.perf_counter() - embed_start) * 1000, 2)
 
         # Search similar chunks
@@ -81,6 +89,9 @@ class RAGEngine:
             retrieval_k,
             rag_query.min_similarity,
             source_id=rag_query.source_id,
+            query_text=retrieval_question_text,
+            metadata_filters=rag_query.metadata_filters,
+            retrieval_mode=rag_query.retrieval_mode,
         )
         timings_ms["search"] = round((time.perf_counter() - search_start) * 1000, 2)
 
@@ -104,6 +115,7 @@ class RAGEngine:
         timings_ms["total"] = total_ms
 
         # Audit log
+        retrieval_debug = self._build_retrieval_debug(results, limit=8)
         self.vector_db.log_query(
             user_id,
             rag_query.question,
@@ -114,6 +126,10 @@ class RAGEngine:
                 "retrieved_count": len(results),
                 "prompt_context_count": prompt_context_count,
                 "source_id": rag_query.source_id,
+                "retrieval_mode": rag_query.retrieval_mode,
+                "metadata_filters": rag_query.metadata_filters or {},
+                "retrieval_question": retrieval_question_text,
+                "retrieval_debug": retrieval_debug,
                 "timings_ms": timings_ms,
             },
         )
@@ -186,6 +202,47 @@ class RAGEngine:
                 chunk_metadata, doc_metadata, "heading", "section_header"
             ),
             "similarity": chunk.get("similarity"),
+            "lexical_score": chunk.get("lexical_score"),
+            "hybrid_score": chunk.get("hybrid_score"),
+        }
+
+    def _build_retrieval_debug(
+        self, results: List[Dict], limit: int = 8
+    ) -> Dict[str, object]:
+        part_counts: Dict[str, int] = {}
+        top_sources: List[Dict[str, object]] = []
+
+        for result in results:
+            metadata = self._extract_source_metadata(result)
+            part_value = metadata.get("part")
+            part_key = (
+                str(part_value).strip()
+                if part_value not in (None, "")
+                else "(none)"
+            )
+            part_counts[part_key] = part_counts.get(part_key, 0) + 1
+
+        for result in results[: max(limit, 0)]:
+            metadata = self._extract_source_metadata(result)
+            snippet = (result.get("content") or "").strip().replace("\n", " ")
+            if len(snippet) > 180:
+                snippet = f"{snippet[:177]}..."
+            top_sources.append(
+                {
+                    "chunk_id": result.get("chunk_id"),
+                    "part": metadata.get("part"),
+                    "section": metadata.get("section"),
+                    "heading": metadata.get("heading"),
+                    "similarity": metadata.get("similarity"),
+                    "lexical_score": metadata.get("lexical_score"),
+                    "hybrid_score": metadata.get("hybrid_score"),
+                    "snippet": snippet,
+                }
+            )
+
+        return {
+            "part_distribution": part_counts,
+            "top_sources": top_sources,
         }
 
     def _build_prompt(
@@ -302,18 +359,47 @@ Provide a detailed answer based only on the information above. If you don't know
     def _generate_answer(self, query: RAGQuery, prompt: str) -> str:
         """Generate answer using LLM"""
         if query.llm_provider == LLMProvider.OPENAI:
-            response = openai.ChatCompletion.create(
-                model="gpt-4",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a regulatory compliance expert.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=query.temperature,
-            )
-            return response.choices[0].message.content
+            if not self.openai_client:
+                raise HTTPException(
+                    status_code=500, detail="OPENAI_API_KEY not configured"
+                )
+
+            openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            timeout = float(os.getenv("OPENAI_TIMEOUT", "120"))
+
+            try:
+                response = self.openai_client.chat.completions.create(
+                    model=openai_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are a regulatory compliance expert.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=query.temperature,
+                    max_tokens=2048,
+                    timeout=timeout,
+                )
+                return (response.choices[0].message.content or "").strip()
+            except openai.APITimeoutError:
+                raise HTTPException(status_code=504, detail="OpenAI timeout")
+            except openai.APIConnectionError:
+                raise HTTPException(status_code=503, detail="Cannot connect to OpenAI")
+            except openai.APIStatusError as e:
+                status_code = getattr(e, "status_code", 500) or 500
+                detail = (
+                    getattr(e, "message", None)
+                    or str(e)
+                    or "OpenAI request failed"
+                )
+                logger.error(f"OpenAI API status error: {detail}")
+                raise HTTPException(
+                    status_code=status_code, detail=f"OpenAI error: {detail}"
+                )
+            except Exception as e:
+                logger.error(f"OpenAI error: {e}")
+                raise HTTPException(status_code=500, detail=f"OpenAI error: {str(e)}")
 
         elif query.llm_provider == LLMProvider.ANTHROPIC:
             response = self.anthropic_client.messages.create(
@@ -547,7 +633,68 @@ Provide a detailed answer based only on the information above. If you don't know
         except requests.exceptions.ConnectionError:
             yield "\n\n[Error] Cannot connect to OpenRouter.\n"
         except requests.exceptions.HTTPError as e:
-            detail = e.response.text if e.response is not None else str(e)
-            yield f"\n\n[Error] OpenRouter HTTP error: {detail}\n"
+            status_code = e.response.status_code if e.response is not None else None
+            response_text = (
+                (e.response.text or "").strip() if e.response is not None else ""
+            )
+            detail = response_text
+            if not detail and e.response is not None:
+                try:
+                    error_payload = e.response.json()
+                    detail = json.dumps(error_payload, ensure_ascii=False)
+                except Exception:
+                    detail = ""
+            if not detail:
+                detail = str(e)
+            status_fragment = f"{status_code} " if status_code is not None else ""
+            yield f"\n\n[Error] OpenRouter HTTP error: {status_fragment}{detail}\n"
         except Exception as e:
             yield f"\n\n[Error] OpenRouter streaming error: {str(e)}\n"
+
+    def _openai_stream(
+        self, prompt: str, temperature: float = 0.7, max_tokens: int = 2048
+    ):
+        """Stream response from OpenAI chat completions."""
+        if not self.openai_client:
+            yield "\n\n[Error] OPENAI_API_KEY not configured.\n"
+            return
+
+        openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        timeout = float(os.getenv("OPENAI_STREAM_TIMEOUT", "300"))
+
+        try:
+            stream = self.openai_client.chat.completions.create(
+                model=openai_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a regulatory compliance expert.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                stream=True,
+            )
+
+            for chunk in stream:
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = getattr(choice, "delta", None)
+                token = getattr(delta, "content", None) if delta else None
+                if token:
+                    yield token
+        except openai.APITimeoutError:
+            yield "\n\n[Error] OpenAI timeout while streaming.\n"
+        except openai.APIConnectionError:
+            yield "\n\n[Error] Cannot connect to OpenAI.\n"
+        except openai.APIStatusError as e:
+            status_code = getattr(e, "status_code", None)
+            detail = getattr(e, "message", None) or str(e) or "OpenAI request failed"
+            status_fragment = f"{status_code} " if status_code is not None else ""
+            yield f"\n\n[Error] OpenAI HTTP error: {status_fragment}{detail}\n"
+        except Exception as e:
+            yield f"\n\n[Error] OpenAI streaming error: {str(e)}\n"

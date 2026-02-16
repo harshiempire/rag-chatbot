@@ -124,6 +124,9 @@ class RAGQuery(BaseModel):
     min_similarity: float = 0.2
     session_id: Optional[str] = None
     chat_history: Optional[List[Dict[str, str]]] = None
+    conversation_context: Optional[List[str]] = None
+    metadata_filters: Optional[Dict[str, Any]] = None
+    retrieval_mode: Literal["dense", "hybrid"] = "hybrid"
 
 
 class RAGResponse(BaseModel):
