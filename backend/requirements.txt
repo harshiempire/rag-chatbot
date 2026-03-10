@@ -10,5 +10,6 @@ psycopg2-binary
 pgvector
 langchain
 langchain-text-splitters
+langsmith
 sentence-transformers
 google-genai

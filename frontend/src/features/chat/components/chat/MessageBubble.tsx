@@ -5,6 +5,7 @@ import {
   ChevronRight,
   FileText,
   AlertCircle,
+  AlertTriangle,
 } from "lucide-react";
 
 import { MarkdownRenderer } from "../MarkdownRenderer";
@@ -88,6 +89,30 @@ export function MessageBubble({ message, isStreaming }: MessageBubbleProps) {
                 ))}
               </div>
             )}
+          </div>
+        )}
+
+        {/* Ungrounded caveat banner — Decision 1 */}
+        {message.isGrounded === false && (
+          <div className="bg-amber-900/20 border border-amber-500/40 text-amber-200 px-4 py-3 rounded-lg text-sm flex items-start gap-3 mb-2">
+            <AlertTriangle className="w-5 h-5 flex-shrink-0 text-amber-400 mt-0.5" />
+            <div>
+              <p className="font-medium">Ungrounded answer</p>
+              <p className="text-amber-300/80 text-xs mt-1">
+                No trained documents were found for this question. This answer uses general LLM
+                knowledge and may be inaccurate for your regulatory context.
+              </p>
+              {message.ticketLink && (
+                <a
+                  href={message.ticketLink}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-block mt-2 text-xs text-amber-400 underline hover:text-amber-200 transition-colors"
+                >
+                  Submit a ticket to train the model on this topic →
+                </a>
+              )}
+            </div>
           </div>
         )}
 

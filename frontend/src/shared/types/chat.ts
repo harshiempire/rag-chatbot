@@ -55,6 +55,9 @@ export interface FinalEvent {
     timings_ms: Record<string, number>;
     retrieved_count: number;
     prompt_context_count: number;
+    /** false when RAG found no documents and fell back to an ungrounded LLM response (Decision 1) */
+    is_grounded?: boolean;
+    ticket_link?: string | null;
   };
 }
 
@@ -103,6 +106,9 @@ export interface ChatMessage {
   sources?: ChatSource[];
   statusHistory?: PipelineStatusItem[];
   usage?: ChatUsage;
+  /** false when this response is ungrounded (RAG found no documents) — Decision 1 */
+  isGrounded?: boolean;
+  ticketLink?: string | null;
 }
 
 export interface ChatSession {

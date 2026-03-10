@@ -11,7 +11,10 @@ import os
 import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+import xml.etree.ElementTree as ET
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+import requests
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
@@ -22,6 +25,7 @@ from app.config import (
     RAG_MAX_QUESTION_CHARS,
     REFRESH_COOKIE_NAME,
     REFRESH_TOKEN_EXPIRE_DAYS,
+    TICKET_SUBMIT_URL,
 )
 from app.core.auth import (
     AuthError,
@@ -42,6 +46,8 @@ from app.core.schemas import (
     ChatSessionSummaryPayload,
     ChunkingConfig,
     DataSourceDefinition,
+    IngestEcfrChapterRequest,
+    IngestEcfrChapterResponse,
     RAGQuery,
     RAGResponse,
     ReviewDecision,
@@ -1734,7 +1740,33 @@ async def rag_query_stream_endpoint(
     search_ms = round((time.perf_counter() - search_start) * 1000, 2)
 
     if not results:
-        raise HTTPException(status_code=404, detail="No relevant documents found")
+        # Cannot-answer fallback (Decision 1) — text stream path
+        caveat = (
+            "⚠️ I have not been trained on this question. The following answer is "
+            "ungrounded — it comes from the LLM's general knowledge and may be "
+            "incorrect for your regulatory context.\n\n"
+        )
+        ticket_suffix = (
+            f"\n\n[Submit a ticket to train the model on this topic]({TICKET_SUBMIT_URL})"
+        )
+        ungrounded_prompt = RAGEngine._build_ungrounded_prompt(prompt_question)
+        engine.vector_db.log_query(
+            user_id, query.question, query.llm_provider.value,
+            DataClassification.PUBLIC.value, True,
+            details={"retrieved_count": 0, "ungrounded": True},
+        )
+
+        def _ungrounded_stream():
+            yield caveat
+            if query.llm_provider == LLMProvider.LOCAL:
+                yield from engine._ollama_stream(ungrounded_prompt)
+            else:
+                yield from engine._openrouter_stream(
+                    ungrounded_prompt, temperature=query.temperature
+                )
+            yield ticket_suffix
+
+        return StreamingResponse(_ungrounded_stream(), media_type="text/plain")
 
     max_class = engine._get_max_classification([r["classification"] for r in results])
 
@@ -1941,9 +1973,84 @@ async def rag_query_stream_events_endpoint(
             timings_ms["search"] = search_ms
 
             if not results:
+                # Cannot-answer fallback (Decision 1) — SSE path
+                caveat_text = (
+                    "⚠️ I have not been trained on this question. The following answer is "
+                    "ungrounded — it comes from the LLM's general knowledge and may be "
+                    "incorrect for your regulatory context.\n\n"
+                )
+                ungrounded_prompt = RAGEngine._build_ungrounded_prompt(prompt_question)
                 yield _sse_event(
-                    "error",
-                    {"code": "NO_RESULTS", "message": "No relevant documents found"},
+                    "status",
+                    {
+                        "stage": "retrieval",
+                        "state": "done",
+                        "label": "No documents found — falling back to ungrounded answer",
+                        "meta": {"retrieved_count": 0},
+                    },
+                )
+                yield _sse_event(
+                    "status",
+                    {"stage": "generation", "state": "start", "label": "Generating ungrounded answer"},
+                )
+                yield _sse_event("token", {"text": caveat_text})
+                ug_answer_parts: List[str] = [caveat_text]
+                ug_llm_start = time.perf_counter()
+                if query.llm_provider == LLMProvider.LOCAL:
+                    ug_stream_iter = engine._ollama_stream(ungrounded_prompt)
+                    ug_error_code = "LOCAL_LLM_ERROR"
+                elif query.llm_provider == LLMProvider.OPENAI:
+                    ug_stream_iter = engine._openai_stream(
+                        ungrounded_prompt, temperature=query.temperature
+                    )
+                    ug_error_code = "OPENAI_STREAM_ERROR"
+                else:
+                    ug_stream_iter = engine._openrouter_stream(
+                        ungrounded_prompt, temperature=query.temperature
+                    )
+                    ug_error_code = "OPENROUTER_STREAM_ERROR"
+                for token in ug_stream_iter:
+                    if token and token.lstrip().startswith("[Error]"):
+                        yield _sse_event("error", {"code": ug_error_code, "message": token.strip()})
+                        yield _sse_event("done", {})
+                        return
+                    if token:
+                        ug_answer_parts.append(token)
+                        yield _sse_event("token", {"text": token})
+                ticket_suffix = (
+                    f"\n\n[Submit a ticket to train the model on this topic]({TICKET_SUBMIT_URL})"
+                )
+                ug_answer_parts.append(ticket_suffix)
+                yield _sse_event("token", {"text": ticket_suffix})
+                ug_llm_ms = round((time.perf_counter() - ug_llm_start) * 1000, 2)
+                ug_total_ms = round((time.perf_counter() - total_start) * 1000, 2)
+                timings_ms.update(
+                    {"prompt_build": 0.0, "llm": ug_llm_ms, "total": ug_total_ms}
+                )
+                engine.vector_db.log_query(
+                    user_id, query.question, query.llm_provider.value,
+                    DataClassification.PUBLIC.value, True,
+                    details={"retrieved_count": 0, "ungrounded": True, "timings_ms": timings_ms},
+                )
+                yield _sse_event(
+                    "status",
+                    {
+                        "stage": "generation",
+                        "state": "done",
+                        "label": "Ungrounded answer complete",
+                        "meta": {"duration_ms": ug_llm_ms},
+                    },
+                )
+                yield _sse_event(
+                    "final",
+                    {
+                        "answer": "".join(ug_answer_parts).strip(),
+                        "timings_ms": timings_ms,
+                        "retrieved_count": 0,
+                        "prompt_context_count": 0,
+                        "is_grounded": False,
+                        "ticket_link": TICKET_SUBMIT_URL,
+                    },
                 )
                 yield _sse_event("done", {})
                 return
@@ -2127,6 +2234,8 @@ async def rag_query_stream_events_endpoint(
                     "timings_ms": timings_ms,
                     "retrieved_count": len(results),
                     "prompt_context_count": prompt_context_count,
+                    "is_grounded": True,
+                    "ticket_link": None,
                 },
             )
             yield _sse_event("done", {})
@@ -2244,3 +2353,182 @@ async def get_audit_log(limit: int = 100):
         cur.close()
 
     return {"logs": logs, "total": len(logs)}
+
+
+# ---------------------------------------------------------------------------
+# eCFR Chapter Ingestion (Decision 3)
+# User-accessible endpoint that ports the CLI script to an HTTP endpoint.
+# ---------------------------------------------------------------------------
+
+
+def _ecfr_find_chapter(title_json: Dict, chapter_id: str) -> Optional[Dict]:
+    """Walk eCFR title structure JSON to find a chapter node by identifier."""
+    for child in title_json.get("children", []):
+        if child.get("type") == "chapter" and child.get("identifier") == chapter_id:
+            return child
+    return None
+
+
+def _ecfr_collect_parts(node: Dict) -> List[str]:
+    """Recursively collect part identifiers from a chapter node."""
+    parts: List[str] = []
+    seen: set = set()
+
+    def _walk(n: Dict) -> None:
+        if isinstance(n, dict):
+            if n.get("type") == "part" and n.get("identifier"):
+                ident = str(n["identifier"])
+                if ident not in seen:
+                    seen.add(ident)
+                    parts.append(ident)
+            for child in n.get("children", []) or []:
+                _walk(child)
+
+    _walk(node)
+    return parts
+
+
+def _ecfr_iter_sections(title: int, date: str, part: str) -> Iterator[Dict]:
+    """
+    Fetch full XML from ecfr.gov for a title/date/part and yield
+    {section, heading, content} dicts for each SECTION div found.
+    """
+    url = (
+        f"https://www.ecfr.gov/api/versioner/v1/full/{date}/title-{title}.xml"
+        f"?part={part}"
+    )
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    xml_root = ET.fromstring(resp.text)
+    for div in xml_root.iter():
+        if div.tag.startswith("DIV") and div.attrib.get("TYPE") == "SECTION":
+            head = div.find("HEAD")
+            text_parts: List[str] = []
+            if head is not None and head.text:
+                text_parts.append(head.text.strip())
+            for p in div.findall("P"):
+                p_text = "".join(p.itertext()).strip()
+                if p_text:
+                    text_parts.append(p_text)
+            content = "\n".join(text_parts).strip()
+            if not content:
+                continue
+            yield {
+                "section": div.attrib.get("N", ""),
+                "heading": head.text.strip() if (head is not None and head.text) else "",
+                "content": content,
+            }
+
+
+@router.post(
+    "/ingest/ecfr-chapter",
+    response_model=IngestEcfrChapterResponse,
+    status_code=202,
+)
+async def ingest_ecfr_chapter(
+    payload: IngestEcfrChapterRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Fetch and ingest an eCFR chapter into the vector store (Decision 3).
+
+    Authenticated endpoint — any logged-in user may trigger ingestion.
+    After ingestion, call POST /api/v1/workflow/complete?source_id=<source_id>
+    to chunk and embed the newly inserted documents.
+    """
+    vector_db = get_vector_db()
+    date_str = payload.date if payload.date.lower() != "current" else "current"
+
+    # 1. Fetch chapter structure from eCFR
+    structure_url = (
+        f"https://www.ecfr.gov/api/versioner/v1/structure/{date_str}"
+        f"/title-{payload.title}.json"
+    )
+    try:
+        struct_resp = requests.get(structure_url, timeout=60)
+        struct_resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch eCFR structure: {exc}",
+        )
+
+    title_json = struct_resp.json()
+    chapter_node = _ecfr_find_chapter(title_json, payload.chapter)
+    if not chapter_node:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Chapter {payload.chapter} not found in title {payload.title}.",
+        )
+
+    parts = _ecfr_collect_parts(chapter_node)
+    if not parts:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No parts found under chapter {payload.chapter}.",
+        )
+
+    source_id = (
+        payload.source_id
+        or f"ecfr-title-{payload.title}-chapter-{payload.chapter.lower()}"
+    )
+
+    # 2. Insert sections into the documents table
+    inserted = 0
+    with vector_db.get_connection() as conn:
+        with conn.cursor() as cur:
+            for part in parts:
+                try:
+                    for section in _ecfr_iter_sections(payload.title, date_str, part):
+                        doc_id = str(uuid.uuid4())
+                        metadata = {
+                            "title": payload.title,
+                            "chapter": payload.chapter,
+                            "part": part,
+                            "section": section["section"],
+                            "heading": section["heading"],
+                            "type": "SECTION",
+                            "source": "ecfr",
+                            "date": date_str,
+                        }
+                        cur.execute(
+                            """
+                            INSERT INTO documents
+                                (id, source_id, content, metadata, classification,
+                                 status, pii_detected)
+                            VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (
+                                doc_id,
+                                source_id,
+                                section["content"],
+                                json.dumps(metadata),
+                                payload.classification.value,
+                                "published",
+                                False,
+                            ),
+                        )
+                        inserted += 1
+                except requests.exceptions.RequestException as exc:
+                    logger.warning(
+                        f"[ingest_ecfr_chapter] Skipping part {part} — fetch failed: {exc}"
+                    )
+                    continue
+        conn.commit()
+
+    logger.info(
+        f"[ingest_ecfr_chapter] user={current_user['id']} "
+        f"source_id={source_id} inserted={inserted} parts={parts}"
+    )
+
+    return IngestEcfrChapterResponse(
+        source_id=source_id,
+        inserted_documents=inserted,
+        parts_processed=parts,
+        message=(
+            f"Successfully ingested {inserted} sections from chapter "
+            f"{payload.chapter} (title {payload.title}) into source '{source_id}'. "
+            f"Call POST /api/v1/workflow/complete?source_id={source_id} to vectorize."
+        ),
+    )

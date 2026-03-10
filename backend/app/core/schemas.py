@@ -113,6 +113,48 @@ class ReviewDecision(BaseModel):
     classification_override: Optional[DataClassification] = None
 
 
+class IngestEcfrChapterRequest(BaseModel):
+    """Request body for user-facing eCFR chapter ingestion (Decision 3)."""
+
+    title: int = Field(..., ge=1, le=99, description="eCFR title number, e.g. 12")
+    chapter: str = Field(
+        ..., min_length=1, max_length=20, description="Chapter identifier, e.g. 'XII'"
+    )
+    date: str = Field(
+        default="current",
+        description="eCFR version date (YYYY-MM-DD) or 'current'",
+    )
+    source_id: Optional[str] = Field(
+        default=None,
+        max_length=200,
+        description="Optional source_id tag. Auto-generated if omitted.",
+    )
+    classification: DataClassification = DataClassification.PUBLIC
+
+    @validator("chapter")
+    def uppercase_chapter(cls, v: str) -> str:
+        return v.strip().upper()
+
+    @validator("date")
+    def validate_date(cls, v: str) -> str:
+        import re
+        v = v.strip()
+        if v.lower() == "current":
+            return v
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", v):
+            raise ValueError("date must be YYYY-MM-DD or 'current'")
+        return v
+
+
+class IngestEcfrChapterResponse(BaseModel):
+    """Response for eCFR chapter ingestion (Decision 3)."""
+
+    source_id: str
+    inserted_documents: int
+    parts_processed: List[str]
+    message: str
+
+
 class RAGQuery(BaseModel):
     """RAG query request"""
     question: str = Field(max_length=RAG_MAX_QUESTION_CHARS)
@@ -139,6 +181,9 @@ class RAGResponse(BaseModel):
     prompt_context_count: int
     total_ms: float
     timings_ms: Dict[str, float]
+    # Grounding state — False when RAG found no documents and fell back to ungrounded LLM
+    is_grounded: bool = True
+    ticket_link: Optional[str] = None
 
 
 class UserSignupRequest(BaseModel):

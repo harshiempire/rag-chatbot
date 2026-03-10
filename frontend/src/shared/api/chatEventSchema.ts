@@ -36,6 +36,9 @@ const finalEventSchema = z.object({
     timings_ms: z.record(z.number()),
     retrieved_count: z.number(),
     prompt_context_count: z.number(),
+    // Grounding state — Decision 1
+    is_grounded: z.boolean().optional(),
+    ticket_link: z.string().nullable().optional(),
   }),
 });
 

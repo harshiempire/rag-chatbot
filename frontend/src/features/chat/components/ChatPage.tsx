@@ -42,7 +42,8 @@ type ChatAction =
   | { type: 'set_error'; messageId: string; error: string }
   | { type: 'set_usage'; messageId: string; usage: ChatUsage }
   | { type: 'apply_final'; messageId: string; answer: string }
-  | { type: 'complete'; messageId: string };
+  | { type: 'complete'; messageId: string }
+  | { type: 'set_grounding'; messageId: string; isGrounded: boolean; ticketLink?: string | null };
 
 const initialState: ChatState = {
   session: null,
@@ -169,6 +170,17 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
             statusHistory: newHistory
           };
         }),
+      };
+    }
+    case 'set_grounding': {
+      if (!state.session) return state;
+      return {
+        ...state,
+        session: updateAssistantMessage(state.session, action.messageId, (message) => ({
+          ...message,
+          isGrounded: action.isGrounded,
+          ticketLink: action.ticketLink,
+        })),
       };
     }
     default:
@@ -579,6 +591,15 @@ export function ChatPage() {
                 promptContextCount: event.data.prompt_context_count,
               },
             });
+            // Ungrounded fallback — Decision 1
+            if (event.data.is_grounded === false) {
+              dispatchStreamAction({
+                type: 'set_grounding',
+                messageId: assistantMessageId,
+                isGrounded: false,
+                ticketLink: event.data.ticket_link,
+              });
+            }
             return;
           }
 

@@ -18,13 +18,22 @@ import requests
 from fastapi import HTTPException
 from google import genai
 
-from app.config import RAG_MAX_QUESTION_CHARS
+from app.config import RAG_MAX_QUESTION_CHARS, TICKET_SUBMIT_URL
 from app.core.database import VectorDatabase
 from app.core.enums import DataClassification, LLMProvider
 from app.core.schemas import RAGQuery, RAGResponse
 from app.vectorization.engine import DEFAULT_EMBEDDING_MODEL, VectorizationEngine
 
 logger = logging.getLogger(__name__)
+
+# LangSmith tracing — guarded so the app runs even when langsmith is not installed
+# or LANGSMITH_TRACING is disabled. Falls back to a transparent no-op decorator.
+try:
+    from langsmith import traceable as _ls_traceable
+    from app.config import LANGSMITH_TRACING_ENABLED as _ls_enabled
+    _traceable = _ls_traceable if _ls_enabled else lambda **kw: (lambda fn: fn)
+except ImportError:
+    _traceable = lambda **kw: (lambda fn: fn)  # noqa: E731
 
 # Retrieval/prompt caps
 RAG_RETRIEVE_K = int(os.getenv("RAG_RETRIEVE_K", "8"))
@@ -60,6 +69,7 @@ class RAGEngine:
         else:
             self.gemini_client = None
 
+    @_traceable(name="rag_pipeline", run_type="chain")
     def query(
         self,
         rag_query: RAGQuery,
@@ -96,7 +106,52 @@ class RAGEngine:
         timings_ms["search"] = round((time.perf_counter() - search_start) * 1000, 2)
 
         if not results:
-            raise HTTPException(status_code=404, detail="No relevant documents found")
+            # --- Cannot-answer fallback (Decision 1) ---
+            # RAG found nothing → send to LLM ungrounded with a clear caveat
+            # and provide a link for the user to request training.
+            ungrounded_prompt = self._build_ungrounded_prompt(
+                prompt_question or rag_query.question
+            )
+            llm_start = time.perf_counter()
+            ungrounded_answer = self._generate_answer(rag_query, ungrounded_prompt)
+            timings_ms["llm"] = round((time.perf_counter() - llm_start) * 1000, 2)
+            timings_ms["prompt_build"] = 0.0
+            total_ms = round((time.perf_counter() - total_start) * 1000, 2)
+            timings_ms["total"] = total_ms
+            caveat = (
+                "⚠️ I have not been trained on this question. The following answer is "
+                "ungrounded — it comes from the LLM's general knowledge and may be "
+                "incorrect for your regulatory context.\n\n"
+            )
+            ticket_suffix = (
+                f"\n\n[Submit a ticket to train the model on this topic]({TICKET_SUBMIT_URL})"
+            )
+            full_answer = caveat + ungrounded_answer + ticket_suffix
+            self.vector_db.log_query(
+                user_id,
+                rag_query.question,
+                rag_query.llm_provider.value,
+                DataClassification.PUBLIC.value,
+                True,
+                details={
+                    "retrieved_count": 0,
+                    "prompt_context_count": 0,
+                    "ungrounded": True,
+                    "timings_ms": timings_ms,
+                },
+            )
+            return RAGResponse(
+                answer=full_answer,
+                sources=[],
+                classification=DataClassification.PUBLIC,
+                llm_provider=rag_query.llm_provider,
+                retrieved_count=0,
+                prompt_context_count=0,
+                total_ms=total_ms,
+                timings_ms=timings_ms,
+                is_grounded=False,
+                ticket_link=TICKET_SUBMIT_URL,
+            )
 
         # Get max classification
         max_class = self._get_max_classification([r["classification"] for r in results])
@@ -145,6 +200,18 @@ class RAGEngine:
             timings_ms=timings_ms,
         )
 
+    @staticmethod
+    def _build_ungrounded_prompt(question: str) -> str:
+        """Build a prompt for queries the knowledge base cannot answer (Decision 1)."""
+        return (
+            "You are a regulatory compliance assistant. "
+            "No relevant documents were found in the knowledge base for this question. "
+            "Answer based on your general knowledge, but be explicit that your answer is "
+            "NOT drawn from trained regulatory documents and the user must verify with "
+            "official sources before relying on this information.\n\n"
+            f"Question: {question.strip()}"
+        )
+
     def _validate_llm_access(
         self, llm_provider: LLMProvider, classifications: List[DataClassification]
     ):
@@ -167,6 +234,7 @@ class RAGEngine:
                 return DataClassification(name)
         return DataClassification.PUBLIC
 
+    @_traceable(name="embed_query", run_type="embedding")
     def get_query_embedding(self, question: str) -> List[float]:
         """Generate query embedding with canonical embedding model."""
         if self.vectorization is None:
@@ -245,6 +313,7 @@ class RAGEngine:
             "top_sources": top_sources,
         }
 
+    @_traceable(name="build_prompt", run_type="tool")
     def _build_prompt(
         self, question: str, context_chunks: List[Dict]
     ) -> tuple[str, int]:
@@ -356,6 +425,7 @@ Provide a detailed answer based only on the information above. If you don't know
             prompt = prompt[:MAX_PROMPT_CHARS].rstrip()
         return prompt, used
 
+    @_traceable(name="generate_answer", run_type="llm")
     def _generate_answer(self, query: RAGQuery, prompt: str) -> str:
         """Generate answer using LLM"""
         if query.llm_provider == LLMProvider.OPENAI:
