@@ -544,7 +544,7 @@ def _sse_non_rag_response(
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-    return None
+
 
 
 def _sse_event(event_type: str, data: Dict[str, Any]) -> str:
