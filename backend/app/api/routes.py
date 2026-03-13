@@ -1817,6 +1817,8 @@ async def rag_query_stream_endpoint(
 
     if query.llm_provider == LLMProvider.LOCAL:
         token_stream = engine._ollama_stream(prompt)
+    elif query.llm_provider == LLMProvider.OPENAI:
+        token_stream = engine._openai_stream(prompt, temperature=query.temperature)
     else:
         token_stream = engine._openrouter_stream(prompt, temperature=query.temperature)
 
