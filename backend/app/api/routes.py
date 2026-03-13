@@ -1760,10 +1760,15 @@ async def rag_query_stream_endpoint(
             yield caveat
             if query.llm_provider == LLMProvider.LOCAL:
                 yield from engine._ollama_stream(ungrounded_prompt)
+            elif query.llm_provider == LLMProvider.OPENAI:
+                yield from engine._openai_stream(
+                    ungrounded_prompt, temperature=query.temperature
+                )
             else:
                 yield from engine._openrouter_stream(
                     ungrounded_prompt, temperature=query.temperature
                 )
+            yield ticket_suffix
             yield ticket_suffix
 
         return StreamingResponse(_ungrounded_stream(), media_type="text/plain")
