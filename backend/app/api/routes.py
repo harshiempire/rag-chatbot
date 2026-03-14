@@ -892,7 +892,9 @@ def _is_followup_reference_question(question: str) -> bool:
         return True
     if len(lower.split()) <= 10 and FOLLOWUP_REFERENCE_PATTERN.search(lower):
         return True
-    return bool(FOLLOWUP_REFERENCE_PATTERN.search(lower))
+    if FOLLOWUP_REFERENCE_PATTERN.search(lower) and len(lower.split()) <= 10:
+        return True
+    return False
 
 
 def _question_for_retrieval(
