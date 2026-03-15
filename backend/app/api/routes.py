@@ -1935,6 +1935,7 @@ async def rag_query_stream_events_endpoint(
         # Enter LangSmith parent span — all @traceable child calls nest under it.
         _ls_ctx = _ls_request_context(user_id, query.session_id, query.question)
         _ls_ctx.__enter__()
+        _ls_exc: tuple = (None, None, None)
         total_start = time.perf_counter()
         timings_ms: Dict[str, float] = {}
         try:
@@ -2273,12 +2274,14 @@ async def rag_query_stream_events_endpoint(
             )
             yield _sse_event("done", {})
         except Exception as e:
+            import sys
+            _ls_exc = sys.exc_info()
             logger.error(f"❌ Structured stream failed: {e}")
             yield _sse_event("error", {"code": "STREAM_FAILURE", "message": str(e)})
             yield _sse_event("done", {})
         finally:
-            # Close LangSmith parent span whether the generator succeeds or fails.
-            _ls_ctx.__exit__(None, None, None)
+            # Close LangSmith parent span, forwarding exception info if present.
+            _ls_ctx.__exit__(*_ls_exc)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -2316,6 +2319,7 @@ async def rag_agent_stream_events(
     async def event_generator():
         _ls_ctx = _ls_request_context(user_id, query.session_id, question)
         _ls_ctx.__enter__()
+        _ls_exc: tuple = (None, None, None)
         yield _sse_event(
             "status",
             {"stage": "agent", "state": "start", "label": "Agent thinking…"},
@@ -2332,11 +2336,13 @@ async def rag_agent_stream_events(
                 if event_type in ("final", "error"):
                     break
         except Exception as exc:
+            import sys
+            _ls_exc = sys.exc_info()
             logger.error("Agent stream error: %s", exc)
             yield _sse_event("error", {"code": "AGENT_FAILURE", "message": str(exc)})
         finally:
             yield _sse_event("done", {})
-            _ls_ctx.__exit__(None, None, None)
+            _ls_ctx.__exit__(*_ls_exc)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 

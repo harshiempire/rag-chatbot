@@ -198,7 +198,7 @@ async def run_agent_stream(
     )
 
     agent = create_tool_calling_agent(llm, tools, prompt)
-    executor = AgentExecutor(agent=agent, tools=tools, verbose=False, max_iterations=5)
+    executor = AgentExecutor(agent=agent, tools=tools, verbose=False, max_iterations=5, max_execution_time=30)
 
     done_event = asyncio.Event()
 

@@ -205,10 +205,22 @@ class RAGEngine:
         )
 
     @staticmethod
-    def _create_zammad_ticket(question: str) -> str:
-        """Auto-create a Zammad training ticket. Returns the ticket URL or fallback URL."""
+    def _create_zammad_ticket(question: str, reason: str = "", priority_id: int = 2) -> str:
+        """Auto-create a Zammad training ticket. Returns the ticket URL or fallback URL.
+
+        Args:
+            question: The unanswered question that triggered the ticket.
+            reason: Optional additional context (e.g. from agent tool invocation).
+            priority_id: Zammad priority (1=low, 2=normal, 3=high).
+        """
         if not ZAMMAD_URL or not ZAMMAD_TOKEN:
             return TICKET_SUBMIT_URL
+        body_parts = [
+            f"The RAG chatbot could not answer the following question:\n\nQuestion: {question}",
+        ]
+        if reason:
+            body_parts.append(f"\nReason: {reason}")
+        body_parts.append("\nPlease add relevant training data to the knowledge base.")
         try:
             resp = requests.post(
                 f"{ZAMMAD_URL.rstrip('/')}/api/v1/tickets",
@@ -216,13 +228,10 @@ class RAGEngine:
                     "title": f"Training request: {question[:80]}",
                     "group": ZAMMAD_GROUP,
                     "customer": ZAMMAD_DEFAULT_CUSTOMER,
+                    "priority_id": priority_id,
                     "article": {
                         "subject": "Knowledge gap detected by RAG chatbot",
-                        "body": (
-                            f"The RAG chatbot could not answer the following question:\n\n"
-                            f"Question: {question}\n\n"
-                            f"Please add relevant training data to the knowledge base."
-                        ),
+                        "body": "\n".join(body_parts),
                         "type": "note",
                         "internal": False,
                     },

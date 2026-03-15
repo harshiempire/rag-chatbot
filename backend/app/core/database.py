@@ -5,6 +5,7 @@ Manages connection pooling, schema initialization, document storage,
 vector similarity search, and audit logging.
 """
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -383,10 +384,10 @@ class VectorDatabase:
                 field_expr = (
                     "LOWER(COALESCE("
                     "vc.metadata->>'section',"
-                    "substring(vc.metadata->>'section_header' from '([0-9]+\\.[0-9]+[a-z]?)'),"
-                    "substring(vc.metadata->>'heading' from '([0-9]+\\.[0-9]+[a-z]?)'),"
+                    "substring(vc.metadata->>'section_header' from '([0-9]+\\.[0-9]+[a-z]?(?:\\([a-z0-9]+\\))*)'),"
+                    "substring(vc.metadata->>'heading' from '([0-9]+\\.[0-9]+[a-z]?(?:\\([a-z0-9]+\\))*)'),"
                     "d.metadata->>'section',"
-                    "substring(d.metadata->>'heading' from '([0-9]+\\.[0-9]+[a-z]?)'),"
+                    "substring(d.metadata->>'heading' from '([0-9]+\\.[0-9]+[a-z]?(?:\\([a-z0-9]+\\))*)'),"
                     "''"
                     "))"
                 )
@@ -827,17 +828,19 @@ class VectorDatabase:
                 max_candidates = max(120, top_k)
 
             candidate_k = min(max(top_k * candidate_multiplier, top_k), max_candidates)
-            dense_results = self._dense_similarity_search(
-                cur,
-                query_embedding=query_embedding,
-                classifications=classifications,
-                top_k=candidate_k if mode == "hybrid" else top_k,
-                min_similarity=min_similarity,
-                source_id=source_id,
-                normalized_filters=normalized_filters,
-            )
             query_text_clean = (query_text or "").strip()
+
             if mode != "hybrid" or not query_text_clean:
+                # Dense-only path: reuse the existing cursor.
+                dense_results = self._dense_similarity_search(
+                    cur,
+                    query_embedding=query_embedding,
+                    classifications=classifications,
+                    top_k=top_k,
+                    min_similarity=min_similarity,
+                    source_id=source_id,
+                    normalized_filters=normalized_filters,
+                )
                 if query_text_clean:
                     dense_results = self._rerank_with_query_anchors(
                         dense_results, query_text_clean, normalized_filters
@@ -847,27 +850,60 @@ class VectorDatabase:
                     dense_results, normalized_filters, top_k
                 )
 
-            try:
-                lexical_results = self._lexical_similarity_search(
-                    cur,
-                    query_embedding=query_embedding,
-                    query_text=query_text_clean,
-                    classifications=classifications,
-                    top_k=candidate_k,
-                    source_id=source_id,
-                    normalized_filters=normalized_filters,
-                )
-            except Exception as exc:
-                logger.warning(
-                    f"Lexical retrieval failed; falling back to dense-only search: {exc}"
-                )
-                dense_results = self._rerank_with_query_anchors(
-                    dense_results, query_text_clean, normalized_filters
-                )
-                cur.close()
-                return self._apply_required_part_coverage(
-                    dense_results, normalized_filters, top_k
-                )
+            # Hybrid path: run dense and lexical searches in parallel using separate
+            # pool connections so neither blocks the other.
+            cur.close()
+
+            def _run_dense():
+                with self.get_connection() as conn2:
+                    c = conn2.cursor()
+                    try:
+                        c.execute(f"SET LOCAL ivfflat.probes = {probes}")
+                    except Exception:
+                        pass
+                    result = self._dense_similarity_search(
+                        c,
+                        query_embedding=query_embedding,
+                        classifications=classifications,
+                        top_k=candidate_k,
+                        min_similarity=min_similarity,
+                        source_id=source_id,
+                        normalized_filters=normalized_filters,
+                    )
+                    c.close()
+                    return result
+
+            def _run_lexical():
+                with self.get_connection() as conn3:
+                    c = conn3.cursor()
+                    result = self._lexical_similarity_search(
+                        c,
+                        query_embedding=query_embedding,
+                        query_text=query_text_clean,
+                        classifications=classifications,
+                        top_k=candidate_k,
+                        source_id=source_id,
+                        normalized_filters=normalized_filters,
+                    )
+                    c.close()
+                    return result
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                dense_future = executor.submit(_run_dense)
+                lexical_future = executor.submit(_run_lexical)
+                dense_results = dense_future.result()
+                try:
+                    lexical_results = lexical_future.result()
+                except Exception as exc:
+                    logger.warning(
+                        f"Lexical retrieval failed (reason: {exc}); falling back to dense-only search"
+                    )
+                    dense_results = self._rerank_with_query_anchors(
+                        dense_results, query_text_clean, normalized_filters
+                    )
+                    return self._apply_required_part_coverage(
+                        dense_results, normalized_filters, top_k
+                    )
 
             relaxed_query_text = self._build_relaxed_lexical_query(
                 query_text_clean, normalized_filters
@@ -878,15 +914,18 @@ class VectorDatabase:
                 and len(lexical_results) < min(3, candidate_k)
             ):
                 try:
-                    relaxed_results = self._lexical_similarity_search(
-                        cur,
-                        query_embedding=query_embedding,
-                        query_text=relaxed_query_text,
-                        classifications=classifications,
-                        top_k=candidate_k,
-                        source_id=source_id,
-                        normalized_filters=normalized_filters,
-                    )
+                    with self.get_connection() as conn4:
+                        c4 = conn4.cursor()
+                        relaxed_results = self._lexical_similarity_search(
+                            c4,
+                            query_embedding=query_embedding,
+                            query_text=relaxed_query_text,
+                            classifications=classifications,
+                            top_k=candidate_k,
+                            source_id=source_id,
+                            normalized_filters=normalized_filters,
+                        )
+                        c4.close()
                     lexical_results = self._merge_ranked_results(
                         lexical_results, relaxed_results, candidate_k
                     )
@@ -895,7 +934,6 @@ class VectorDatabase:
                         f"Relaxed lexical retrieval failed; using strict lexical results only: {exc}"
                     )
 
-            cur.close()
             ranked = self._fuse_dense_and_lexical(
                 dense_results, lexical_results, max(candidate_k, top_k)
             )

@@ -11,7 +11,6 @@ import logging
 import os
 from typing import List, Optional
 
-import requests
 from langchain.tools import tool
 
 from app.core.database import VectorDatabase
@@ -73,48 +72,16 @@ def make_tools(
         Inputs: question (the unanswered question), reason (why training data is needed).
         Returns: the ticket URL or a skip notice if Zammad is not configured."""
 
-        from app.config import ZAMMAD_URL, ZAMMAD_TOKEN, ZAMMAD_GROUP, ZAMMAD_DEFAULT_CUSTOMER
-        zammad_url = ZAMMAD_URL.rstrip("/")
-        zammad_token = ZAMMAD_TOKEN
-        zammad_group = ZAMMAD_GROUP
-        zammad_customer = ZAMMAD_DEFAULT_CUSTOMER
+        from app.config import ZAMMAD_URL, TICKET_SUBMIT_URL
+        from app.rag.engine import RAGEngine
 
-        if not zammad_url or not zammad_token:
+        if not ZAMMAD_URL:
             return f"TICKET_SKIPPED: Zammad not configured. Question logged: {question[:200]}"
 
-        payload = {
-            "title": f"Training request: {question[:80]}",
-            "group": zammad_group,
-            "customer": zammad_customer,
-            "article": {
-                "subject": "Knowledge gap detected by RAG agent",
-                "body": (
-                    f"The RAG chatbot could not answer the following question:\n\n"
-                    f"Question: {question}\n\n"
-                    f"Reason: {reason}\n\n"
-                    f"Please add relevant training data to the knowledge base."
-                ),
-                "type": "note",
-                "internal": False,
-            },
-        }
-
-        try:
-            resp = requests.post(
-                f"{zammad_url}/api/v1/tickets",
-                json=payload,
-                headers={
-                    "Authorization": f"Token token={zammad_token}",
-                    "Content-Type": "application/json",
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            ticket_id = resp.json().get("id", "?")
-            return f"TICKET_CREATED: {zammad_url}/#ticket/zoom/{ticket_id}"
-        except Exception as exc:
-            logger.warning("Zammad ticket creation failed: %s", exc)
-            return f"TICKET_FAILED: {exc}"
+        url = RAGEngine._create_zammad_ticket(question, reason=reason)
+        if url and url != TICKET_SUBMIT_URL:
+            return f"TICKET_CREATED: {url}"
+        return f"TICKET_FAILED: Could not create ticket, fallback URL: {url}"
 
     @tool
     def generate_report(topic: str) -> str:
