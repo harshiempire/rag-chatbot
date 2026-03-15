@@ -1802,8 +1802,6 @@ async def rag_query_stream_endpoint(
 
         return StreamingResponse(_ungrounded_stream(), media_type="text/plain")
 
-    max_class = engine._get_max_classification([r["classification"] for r in results])
-
     prompt, prompt_context_count = engine._build_prompt(prompt_question, results)
     timings_for_debug = {
         "routing": round(route_ms, 2),
