@@ -1820,6 +1820,9 @@ async def rag_query_stream_endpoint(
         timings_ms=timings_for_debug,
     )
 
+    max_class = engine._get_max_classification(
+        [r["classification"] for r in results]
+    )
     engine.vector_db.log_query(
         user_id,
         query.question,
