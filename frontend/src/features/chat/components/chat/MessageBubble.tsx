@@ -6,20 +6,24 @@ import {
   FileText,
   AlertCircle,
   AlertTriangle,
+  Ticket,
 } from "lucide-react";
 
 import { MarkdownRenderer } from "../MarkdownRenderer";
 import { StatusHistory } from "./StatusHistory";
+import { TrainingRequestDialog } from "./TrainingRequestDialog";
 import type { ChatMessage } from "../../../../shared/types/chat";
 
 interface MessageBubbleProps {
   message: ChatMessage;
   isStreaming?: boolean;
+  onTicketCreated?: (ticket: { id: number; url: string }) => void;
 }
 
-export function MessageBubble({ message, isStreaming }: MessageBubbleProps) {
+export function MessageBubble({ message, isStreaming, onTicketCreated }: MessageBubbleProps) {
   const isUser = message.role === "user";
   const [showSources, setShowSources] = useState(false);
+  const [showTicketDialog, setShowTicketDialog] = useState(false);
 
   if (isUser) {
     return (
@@ -94,26 +98,51 @@ export function MessageBubble({ message, isStreaming }: MessageBubbleProps) {
 
         {/* Ungrounded caveat banner — Decision 1 */}
         {message.isGrounded === false && (
-          <div className="bg-amber-900/20 border border-amber-500/40 text-amber-200 px-4 py-3 rounded-lg text-sm flex items-start gap-3 mb-2">
-            <AlertTriangle className="w-5 h-5 flex-shrink-0 text-amber-400 mt-0.5" />
-            <div>
-              <p className="font-medium">Ungrounded answer</p>
-              <p className="text-amber-300/80 text-xs mt-1">
-                No trained documents were found for this question. This answer uses general LLM
-                knowledge and may be inaccurate for your regulatory context.
-              </p>
-              {message.ticketLink && (
-                <a
-                  href={message.ticketLink}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-block mt-2 text-xs text-amber-400 underline hover:text-amber-200 transition-colors"
-                >
-                  Submit a ticket to train the model on this topic →
-                </a>
-              )}
+          <>
+            <div className="bg-amber-900/20 border border-amber-500/40 text-amber-200 px-4 py-3 rounded-lg text-sm flex items-start gap-3 mb-2">
+              <AlertTriangle className="w-5 h-5 flex-shrink-0 text-amber-400 mt-0.5" />
+              <div className="flex-1">
+                <p className="font-medium">Ungrounded answer</p>
+                <p className="text-amber-300/80 text-xs mt-1">
+                  No trained documents were found for this question. This answer uses general LLM
+                  knowledge and may be inaccurate for your regulatory context.
+                </p>
+
+                {message.submittedTicket ? (
+                  /* Persistent badge shown after ticket is created */
+                  <a
+                    href={message.submittedTicket.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mt-2 inline-flex items-center gap-1.5 text-xs text-emerald-400 hover:text-emerald-300 transition-colors font-medium"
+                  >
+                    <Ticket className="w-3.5 h-3.5" />
+                    Ticket #{message.submittedTicket.id} submitted — view in Zammad →
+                  </a>
+                ) : (
+                  /* Request training button — shown until ticket is submitted */
+                  <button
+                    onClick={() => setShowTicketDialog(true)}
+                    className="mt-2 inline-flex items-center gap-1.5 text-xs text-amber-400 hover:text-amber-200 transition-colors font-medium"
+                  >
+                    <Ticket className="w-3.5 h-3.5" />
+                    Request training for this topic →
+                  </button>
+                )}
+              </div>
             </div>
-          </div>
+            {showTicketDialog && (
+              <TrainingRequestDialog
+                question={message.originalQuestion ?? message.content.slice(0, 500)}
+                onClose={() => setShowTicketDialog(false)}
+                onTicketCreated={(ticket) => {
+                  // Persist the ticket in the message state immediately so the
+                  // badge is ready as soon as the user closes the success screen.
+                  onTicketCreated?.(ticket);
+                }}
+              />
+            )}
+          </>
         )}
 
         {/* Content */}

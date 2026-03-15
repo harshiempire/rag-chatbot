@@ -35,6 +35,12 @@ TICKET_SUBMIT_URL = os.getenv(
     "https://example.com/submit-training-ticket",
 )
 
+# Zammad ticketing integration (Phase 2 — agent layer)
+ZAMMAD_URL              = os.getenv("ZAMMAD_URL", "")
+ZAMMAD_TOKEN            = os.getenv("ZAMMAD_API_TOKEN", os.getenv("ZAMMAD_TOKEN", ""))
+ZAMMAD_GROUP            = os.getenv("ZAMMAD_GROUP", "Users")
+ZAMMAD_DEFAULT_CUSTOMER = os.getenv("ZAMMAD_DEFAULT_CUSTOMER", "agent@example.com")
+
 # LangSmith observability (Decision 2)
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY", "")
 LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "rag-chatbot")

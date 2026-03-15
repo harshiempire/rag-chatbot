@@ -155,6 +155,20 @@ class IngestEcfrChapterResponse(BaseModel):
     message: str
 
 
+class TicketCreateRequest(BaseModel):
+    """User-initiated training request ticket."""
+    question: str = Field(..., min_length=1, max_length=2000)
+    notes: Optional[str] = Field(default=None, max_length=2000)
+    priority: Literal["low", "normal", "high"] = "normal"
+
+
+class TicketCreateResponse(BaseModel):
+    """Response after creating a Zammad ticket."""
+    ticket_id: int
+    ticket_url: str
+    title: str
+
+
 class RAGQuery(BaseModel):
     """RAG query request"""
     question: str = Field(max_length=RAG_MAX_QUESTION_CHARS)

@@ -109,6 +109,10 @@ export interface ChatMessage {
   /** false when this response is ungrounded (RAG found no documents) — Decision 1 */
   isGrounded?: boolean;
   ticketLink?: string | null;
+  /** the original user question that triggered the ungrounded response */
+  originalQuestion?: string;
+  /** populated after the user successfully submits a training ticket for this message */
+  submittedTicket?: { id: number; url: string };
 }
 
 export interface ChatSession {

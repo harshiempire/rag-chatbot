@@ -43,7 +43,8 @@ type ChatAction =
   | { type: 'set_usage'; messageId: string; usage: ChatUsage }
   | { type: 'apply_final'; messageId: string; answer: string }
   | { type: 'complete'; messageId: string }
-  | { type: 'set_grounding'; messageId: string; isGrounded: boolean; ticketLink?: string | null };
+  | { type: 'set_grounding'; messageId: string; isGrounded: boolean; ticketLink?: string | null; originalQuestion?: string }
+  | { type: 'set_ticket'; messageId: string; ticket: { id: number; url: string } };
 
 const initialState: ChatState = {
   session: null,
@@ -180,6 +181,17 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
           ...message,
           isGrounded: action.isGrounded,
           ticketLink: action.ticketLink,
+          originalQuestion: action.originalQuestion,
+        })),
+      };
+    }
+    case 'set_ticket': {
+      if (!state.session) return state;
+      return {
+        ...state,
+        session: updateAssistantMessage(state.session, action.messageId, (message) => ({
+          ...message,
+          submittedTicket: action.ticket,
         })),
       };
     }
@@ -598,6 +610,7 @@ export function ChatPage() {
                 messageId: assistantMessageId,
                 isGrounded: false,
                 ticketLink: event.data.ticket_link,
+                originalQuestion: text,
               });
             }
             return;
@@ -776,6 +789,16 @@ export function ChatPage() {
           messages={state.session?.messages ?? []}
           isStreaming={isStreaming}
           streamingMessageId={state.streamingMessageId}
+          onTicketCreated={(messageId, ticket) => {
+            dispatch({ type: 'set_ticket', messageId, ticket });
+            // Immediately persist the updated session so the badge survives a refresh.
+            // We apply the reducer manually to get the new session without waiting for
+            // the next render cycle.
+            const updatedSession = chatReducer(state, { type: 'set_ticket', messageId, ticket }).session;
+            if (updatedSession) {
+              void persistSession(updatedSession);
+            }
+          }}
         />
 
         <div className="p-4 bg-gradient-to-t from-slate-950 to-transparent">

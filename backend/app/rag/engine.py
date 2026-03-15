@@ -18,7 +18,14 @@ import requests
 from fastapi import HTTPException
 from google import genai
 
-from app.config import RAG_MAX_QUESTION_CHARS, TICKET_SUBMIT_URL
+from app.config import (
+    RAG_MAX_QUESTION_CHARS,
+    TICKET_SUBMIT_URL,
+    ZAMMAD_URL,
+    ZAMMAD_TOKEN,
+    ZAMMAD_GROUP,
+    ZAMMAD_DEFAULT_CUSTOMER,
+)
 from app.core.database import VectorDatabase
 from app.core.enums import DataClassification, LLMProvider
 from app.core.schemas import RAGQuery, RAGResponse
@@ -123,10 +130,7 @@ class RAGEngine:
                 "ungrounded — it comes from the LLM's general knowledge and may be "
                 "incorrect for your regulatory context.\n\n"
             )
-            ticket_suffix = (
-                f"\n\n[Submit a ticket to train the model on this topic]({TICKET_SUBMIT_URL})"
-            )
-            full_answer = caveat + ungrounded_answer + ticket_suffix
+            full_answer = caveat + ungrounded_answer
             self.vector_db.log_query(
                 user_id,
                 rag_query.question,
@@ -150,7 +154,7 @@ class RAGEngine:
                 total_ms=total_ms,
                 timings_ms=timings_ms,
                 is_grounded=False,
-                ticket_link=TICKET_SUBMIT_URL,
+                ticket_link=None,
             )
 
         # Get max classification
@@ -199,6 +203,43 @@ class RAGEngine:
             total_ms=total_ms,
             timings_ms=timings_ms,
         )
+
+    @staticmethod
+    def _create_zammad_ticket(question: str) -> str:
+        """Auto-create a Zammad training ticket. Returns the ticket URL or fallback URL."""
+        if not ZAMMAD_URL or not ZAMMAD_TOKEN:
+            return TICKET_SUBMIT_URL
+        try:
+            resp = requests.post(
+                f"{ZAMMAD_URL.rstrip('/')}/api/v1/tickets",
+                json={
+                    "title": f"Training request: {question[:80]}",
+                    "group": ZAMMAD_GROUP,
+                    "customer": ZAMMAD_DEFAULT_CUSTOMER,
+                    "article": {
+                        "subject": "Knowledge gap detected by RAG chatbot",
+                        "body": (
+                            f"The RAG chatbot could not answer the following question:\n\n"
+                            f"Question: {question}\n\n"
+                            f"Please add relevant training data to the knowledge base."
+                        ),
+                        "type": "note",
+                        "internal": False,
+                    },
+                },
+                headers={
+                    "Authorization": f"Token token={ZAMMAD_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            ticket_id = resp.json().get("id", "")
+            if ticket_id:
+                return f"{ZAMMAD_URL.rstrip('/')}/#ticket/zoom/{ticket_id}"
+        except Exception as exc:
+            logger.warning("Zammad ticket creation failed: %s", exc)
+        return TICKET_SUBMIT_URL
 
     @staticmethod
     def _build_ungrounded_prompt(question: str) -> str:

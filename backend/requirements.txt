@@ -11,5 +11,7 @@ pgvector
 langchain
 langchain-text-splitters
 langsmith
+langchain-openai
+langchain-anthropic
 sentence-transformers
 google-genai

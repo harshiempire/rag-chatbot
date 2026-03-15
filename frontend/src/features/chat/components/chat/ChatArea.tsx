@@ -8,9 +8,10 @@ interface ChatAreaProps {
     messages: ChatMessage[];
     isStreaming: boolean;
     streamingMessageId: string | null;
+    onTicketCreated?: (messageId: string, ticket: { id: number; url: string }) => void;
 }
 
-export function ChatArea({ messages, isStreaming, streamingMessageId }: ChatAreaProps) {
+export function ChatArea({ messages, isStreaming, streamingMessageId, onTicketCreated }: ChatAreaProps) {
     const bottomRef = useRef<HTMLDivElement>(null);
     const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -32,6 +33,7 @@ export function ChatArea({ messages, isStreaming, streamingMessageId }: ChatArea
                         key={message.id}
                         message={message}
                         isStreaming={isStreaming && message.id === streamingMessageId}
+                        onTicketCreated={onTicketCreated ? (ticket) => onTicketCreated(message.id, ticket) : undefined}
                     />
                 ))}
                 <div ref={bottomRef} className="h-4" />

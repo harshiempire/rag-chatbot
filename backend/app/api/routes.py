@@ -50,6 +50,8 @@ from app.core.schemas import (
     IngestEcfrChapterResponse,
     RAGQuery,
     RAGResponse,
+    TicketCreateRequest,
+    TicketCreateResponse,
     ReviewDecision,
     UserLoginRequest,
     UserPublic,
@@ -70,6 +72,41 @@ from app.vectorization.engine import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# LangSmith tracing helpers — guarded so routes work without langsmith installed
+# ---------------------------------------------------------------------------
+try:
+    from contextlib import nullcontext as _nullcontext
+    from langsmith import trace as _ls_trace
+    from app.config import LANGSMITH_TRACING_ENABLED as _ls_tracing_enabled
+except ImportError:
+    _ls_trace = None  # type: ignore[assignment]
+    _ls_tracing_enabled = False
+    from contextlib import nullcontext as _nullcontext  # type: ignore[assignment]
+
+
+def _ls_request_context(user_id: str, session_id: Optional[str], question: str):
+    """Return a LangSmith parent-span context (or a no-op nullcontext).
+
+    When enabled every RAG request is wrapped in a 'rag_request' run tagged
+    with ``user:{user_id}`` and ``session:{session_id}`` so LangSmith traces
+    are filterable by user and session.
+    """
+    if not (_ls_tracing_enabled and _ls_trace):
+        return _nullcontext()
+    session_tag = session_id or "no-session"
+    return _ls_trace(
+        name="rag_request",
+        run_type="chain",
+        metadata={
+            "user_id": user_id,
+            "session_id": session_id,
+            "question": question[:300],
+        },
+        tags=[f"user:{user_id}", f"session:{session_tag}"],
+    )
+
 
 router = APIRouter(prefix="/api/v1")
 
@@ -253,8 +290,6 @@ def _looks_legal_or_doc_query(question: str, history: List[Dict[str, str]]) -> b
     if any(keyword in text for keyword in LEGAL_KEYWORD_HINTS):
         return True
     if history and _is_followup_reference_question(text):
-        return True
-    if text.endswith("?") and len(text.split()) >= 6:
         return True
     return False
 
@@ -889,8 +924,6 @@ def _is_followup_reference_question(question: str) -> bool:
         return False
     lower = text.lower()
     if lower.startswith(("what about", "and ", "does that", "can that")):
-        return True
-    if len(lower.split()) <= 10 and FOLLOWUP_REFERENCE_PATTERN.search(lower):
         return True
     return bool(FOLLOWUP_REFERENCE_PATTERN.search(lower))
 
@@ -1603,44 +1636,45 @@ async def rag_query_endpoint(
             llm_ms=llm_ms,
             routing_ms=route_ms,
         )
-    try:
-        _log_retrieval_debug(
-            event="query_sync_start",
-            query=query,
-            retrieval_question=retrieval_question,
-            metadata_filters=query_for_rag.metadata_filters or {},
-            route_mode=route_mode,
-            route_reason=route_reason,
-            history_turns=len(history),
-        )
-        response = engine.query(
-            query_for_rag,
-            user_id,
-            prompt_question=prompt_question,
-            retrieval_question=retrieval_question,
-        )
-        response.timings_ms["routing"] = round(route_ms, 2)
-        response.total_ms = round(response.total_ms + route_ms, 2)
-        response.timings_ms["total"] = response.total_ms
-        _log_retrieval_debug(
-            event="query_sync_done",
-            query=query,
-            retrieval_question=retrieval_question,
-            metadata_filters=query_for_rag.metadata_filters or {},
-            route_mode=route_mode,
-            route_reason=route_reason,
-            history_turns=len(history),
-            sources=response.sources,
-            timings_ms=response.timings_ms,
-        )
-        logger.info(f"✅ RAG query by {user_id}: {query.question[:50]}...")
-        return response
-    except HTTPException as e:
-        logger.error(f"❌ RAG query failed: {e.detail}")
-        raise e
-    except Exception as e:
-        logger.error(f"❌ RAG query failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    with _ls_request_context(user_id, query.session_id, query.question):
+        try:
+            _log_retrieval_debug(
+                event="query_sync_start",
+                query=query,
+                retrieval_question=retrieval_question,
+                metadata_filters=query_for_rag.metadata_filters or {},
+                route_mode=route_mode,
+                route_reason=route_reason,
+                history_turns=len(history),
+            )
+            response = engine.query(
+                query_for_rag,
+                user_id,
+                prompt_question=prompt_question,
+                retrieval_question=retrieval_question,
+            )
+            response.timings_ms["routing"] = round(route_ms, 2)
+            response.total_ms = round(response.total_ms + route_ms, 2)
+            response.timings_ms["total"] = response.total_ms
+            _log_retrieval_debug(
+                event="query_sync_done",
+                query=query,
+                retrieval_question=retrieval_question,
+                metadata_filters=query_for_rag.metadata_filters or {},
+                route_mode=route_mode,
+                route_reason=route_reason,
+                history_turns=len(history),
+                sources=response.sources,
+                timings_ms=response.timings_ms,
+            )
+            logger.info(f"✅ RAG query by {user_id}: {query.question[:50]}...")
+            return response
+        except HTTPException as e:
+            logger.error(f"❌ RAG query failed: {e.detail}")
+            raise e
+        except Exception as e:
+            logger.error(f"❌ RAG query failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/rag/query/stream")
@@ -1746,9 +1780,6 @@ async def rag_query_stream_endpoint(
             "ungrounded — it comes from the LLM's general knowledge and may be "
             "incorrect for your regulatory context.\n\n"
         )
-        ticket_suffix = (
-            f"\n\n[Submit a ticket to train the model on this topic]({TICKET_SUBMIT_URL})"
-        )
         ungrounded_prompt = RAGEngine._build_ungrounded_prompt(prompt_question)
         engine.vector_db.log_query(
             user_id, query.question, query.llm_provider.value,
@@ -1768,8 +1799,6 @@ async def rag_query_stream_endpoint(
                 yield from engine._openrouter_stream(
                     ungrounded_prompt, temperature=query.temperature
                 )
-            yield ticket_suffix
-            yield ticket_suffix
 
         return StreamingResponse(_ungrounded_stream(), media_type="text/plain")
 
@@ -1905,6 +1934,9 @@ async def rag_query_stream_events_endpoint(
     )
 
     def event_generator():
+        # Enter LangSmith parent span — all @traceable child calls nest under it.
+        _ls_ctx = _ls_request_context(user_id, query.session_id, query.question)
+        _ls_ctx.__enter__()
         total_start = time.perf_counter()
         timings_ms: Dict[str, float] = {}
         try:
@@ -1981,6 +2013,7 @@ async def rag_query_stream_events_endpoint(
 
             if not results:
                 # Cannot-answer fallback (Decision 1) — SSE path
+                ug_ticket_url = RAGEngine._create_zammad_ticket(query.question)
                 caveat_text = (
                     "⚠️ I have not been trained on this question. The following answer is "
                     "ungrounded — it comes from the LLM's general knowledge and may be "
@@ -2024,11 +2057,6 @@ async def rag_query_stream_events_endpoint(
                     if token:
                         ug_answer_parts.append(token)
                         yield _sse_event("token", {"text": token})
-                ticket_suffix = (
-                    f"\n\n[Submit a ticket to train the model on this topic]({TICKET_SUBMIT_URL})"
-                )
-                ug_answer_parts.append(ticket_suffix)
-                yield _sse_event("token", {"text": ticket_suffix})
                 ug_llm_ms = round((time.perf_counter() - ug_llm_start) * 1000, 2)
                 ug_total_ms = round((time.perf_counter() - total_start) * 1000, 2)
                 timings_ms.update(
@@ -2056,7 +2084,7 @@ async def rag_query_stream_events_endpoint(
                         "retrieved_count": 0,
                         "prompt_context_count": 0,
                         "is_grounded": False,
-                        "ticket_link": TICKET_SUBMIT_URL,
+                        "ticket_link": None,
                     },
                 )
                 yield _sse_event("done", {})
@@ -2250,6 +2278,67 @@ async def rag_query_stream_events_endpoint(
             logger.error(f"❌ Structured stream failed: {e}")
             yield _sse_event("error", {"code": "STREAM_FAILURE", "message": str(e)})
             yield _sse_event("done", {})
+        finally:
+            # Close LangSmith parent span whether the generator succeeds or fails.
+            _ls_ctx.__exit__(None, None, None)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# Agent endpoint — LangChain tool-calling agent with Zammad + report gen
+# ---------------------------------------------------------------------------
+
+
+@router.post("/rag/agent/stream/events")
+async def rag_agent_stream_events(
+    query: RAGQuery,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    SSE endpoint backed by a LangChain tool-calling agent.
+
+    The agent dynamically decides between:
+      1. knowledge_base_search → grounded answer
+      2. create_zammad_ticket + ungrounded LLM → when KB has no data
+      3. generate_report → structured markdown report on demand
+
+    SSE event types: status | tool_call | tool_result | token | final | done | error
+    """
+    from app.rag.agent import run_agent_stream
+
+    vector_db = get_vector_db()
+    user_id = str(current_user["id"])
+
+    if not query.question or not query.question.strip():
+        raise HTTPException(status_code=422, detail="question is required")
+
+    question = query.question.strip()[:RAG_MAX_QUESTION_CHARS]
+
+    async def event_generator():
+        _ls_ctx = _ls_request_context(user_id, query.session_id, question)
+        _ls_ctx.__enter__()
+        yield _sse_event(
+            "status",
+            {"stage": "agent", "state": "start", "label": "Agent thinking…"},
+        )
+        try:
+            async for event_type, data in run_agent_stream(
+                question=question,
+                vector_db=vector_db,
+                llm_provider=query.llm_provider,
+                user_id=user_id,
+                source_id=query.source_id,
+            ):
+                yield _sse_event(event_type, data)
+                if event_type in ("final", "error"):
+                    break
+        except Exception as exc:
+            logger.error("Agent stream error: %s", exc)
+            yield _sse_event("error", {"code": "AGENT_FAILURE", "message": str(exc)})
+        finally:
+            yield _sse_event("done", {})
+            _ls_ctx.__exit__(None, None, None)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -2427,6 +2516,61 @@ def _ecfr_iter_sections(title: int, date: str, part: str) -> Iterator[Dict]:
             }
 
 
+@router.post("/rag/ticket", response_model=TicketCreateResponse, status_code=201)
+async def create_training_ticket(
+    payload: TicketCreateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """User-initiated training request — creates a Zammad ticket with the unanswered question."""
+    from app.config import ZAMMAD_URL, ZAMMAD_TOKEN, ZAMMAD_GROUP, ZAMMAD_DEFAULT_CUSTOMER
+
+    if not ZAMMAD_URL or not ZAMMAD_TOKEN:
+        raise HTTPException(status_code=503, detail="Ticketing system not configured")
+
+    priority_map = {"low": 1, "normal": 2, "high": 3}
+    body_lines = [
+        f"The RAG chatbot could not answer the following question:\n\nQuestion: {payload.question}",
+    ]
+    if payload.notes:
+        body_lines.append(f"\nAdditional context from user:\n{payload.notes}")
+    body_lines.append("\nPlease add relevant training data to the knowledge base.")
+
+    try:
+        resp = requests.post(
+            f"{ZAMMAD_URL.rstrip('/')}/api/v1/tickets",
+            json={
+                "title": f"Training request: {payload.question[:80]}",
+                "group": ZAMMAD_GROUP,
+                "customer": ZAMMAD_DEFAULT_CUSTOMER,
+                "priority_id": priority_map.get(payload.priority, 2),
+                "article": {
+                    "subject": "Knowledge gap — user-submitted training request",
+                    "body": "\n".join(body_lines),
+                    "type": "note",
+                    "internal": False,
+                },
+            },
+            headers={
+                "Authorization": f"Token token={ZAMMAD_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        ticket_id = data.get("id")
+        if not ticket_id:
+            raise HTTPException(status_code=502, detail="Zammad did not return a ticket ID")
+        return TicketCreateResponse(
+            ticket_id=ticket_id,
+            ticket_url=f"{ZAMMAD_URL.rstrip('/')}/#ticket/zoom/{ticket_id}",
+            title=data.get("title", ""),
+        )
+    except requests.exceptions.RequestException as exc:
+        logger.error(f"Zammad ticket creation failed: {exc}")
+        raise HTTPException(status_code=502, detail=f"Ticketing system error: {exc}")
+
+
 @router.post(
     "/ingest/ecfr-chapter",
     response_model=IngestEcfrChapterResponse,
@@ -2512,7 +2656,7 @@ async def ingest_ecfr_chapter(
                                 section["content"],
                                 json.dumps(metadata),
                                 payload.classification.value,
-                                "published",
+                                "approved",  # 'approved' so workflow/complete vectorizes them
                                 False,
                             ),
                         )
