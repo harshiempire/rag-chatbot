@@ -1,4 +1,4 @@
-import { CheckCircle2, Loader2, Search, Database, FileText, Sparkles } from "lucide-react";
+import { CheckCircle2, Compass, Loader2, Search, Database, FileText, Sparkles } from "lucide-react";
 import { cn } from "../../../../shared/utils/cn";
 import type { PipelineStatusItem } from "../../../../shared/types/chat";
 
@@ -15,6 +15,7 @@ export function StatusItem({ status, done = false }: StatusItemProps) {
         if (!isComplete) return <Loader2 className="h-4 w-4 animate-spin text-blue-400" />;
 
         switch (status.stage) {
+            case "routing": return <Compass className="h-4 w-4 text-green-400" />;
             case "embedding": return <FileText className="h-4 w-4 text-green-400" />;
             case "retrieval": return <Search className="h-4 w-4 text-green-400" />;
             case "prompt_build": return <Database className="h-4 w-4 text-green-400" />;
@@ -28,6 +29,18 @@ export function StatusItem({ status, done = false }: StatusItemProps) {
         // If we have a specific count in metadata, use it
         if (status.stage === "retrieval" && status.state === "done" && status.meta?.retrieved_count !== undefined) {
             const count = status.meta.retrieved_count;
+            const partDistribution = status.meta.part_distribution as Record<string, number> | undefined;
+            if (partDistribution && typeof partDistribution === "object") {
+                const parts = Object.entries(partDistribution)
+                    .filter(([, partCount]) => typeof partCount === "number")
+                    .sort((a, b) => b[1] - a[1])
+                    .slice(0, 3)
+                    .map(([part, partCount]) => `${part}:${partCount}`)
+                    .join(", ");
+                if (parts) {
+                    return `Retrieved ${count} source${count === 1 ? '' : 's'} (${parts})`;
+                }
+            }
             return `Retrieved ${count} source${count === 1 ? '' : 's'}`;
         }
 

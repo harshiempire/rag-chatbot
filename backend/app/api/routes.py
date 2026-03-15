@@ -8,9 +8,13 @@ business logic to the appropriate engine/service classes.
 import json
 import logging
 import os
+import re
 import time
 import uuid
-from typing import Any, Dict, List, Tuple
+import xml.etree.ElementTree as ET
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+import requests
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
@@ -21,6 +25,7 @@ from app.config import (
     RAG_MAX_QUESTION_CHARS,
     REFRESH_COOKIE_NAME,
     REFRESH_TOKEN_EXPIRE_DAYS,
+    TICKET_SUBMIT_URL,
 )
 from app.core.auth import (
     AuthError,
@@ -41,8 +46,12 @@ from app.core.schemas import (
     ChatSessionSummaryPayload,
     ChunkingConfig,
     DataSourceDefinition,
+    IngestEcfrChapterRequest,
+    IngestEcfrChapterResponse,
     RAGQuery,
     RAGResponse,
+    TicketCreateRequest,
+    TicketCreateResponse,
     ReviewDecision,
     UserLoginRequest,
     UserPublic,
@@ -63,6 +72,41 @@ from app.vectorization.engine import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# LangSmith tracing helpers — guarded so routes work without langsmith installed
+# ---------------------------------------------------------------------------
+try:
+    from contextlib import nullcontext as _nullcontext
+    from langsmith import trace as _ls_trace
+    from app.config import LANGSMITH_TRACING_ENABLED as _ls_tracing_enabled
+except ImportError:
+    _ls_trace = None  # type: ignore[assignment]
+    _ls_tracing_enabled = False
+    from contextlib import nullcontext as _nullcontext  # type: ignore[assignment]
+
+
+def _ls_request_context(user_id: str, session_id: Optional[str], question: str):
+    """Return a LangSmith parent-span context (or a no-op nullcontext).
+
+    When enabled every RAG request is wrapped in a 'rag_request' run tagged
+    with ``user:{user_id}`` and ``session:{session_id}`` so LangSmith traces
+    are filterable by user and session.
+    """
+    if not (_ls_tracing_enabled and _ls_trace):
+        return _nullcontext()
+    session_tag = session_id or "no-session"
+    return _ls_trace(
+        name="rag_request",
+        run_type="chain",
+        metadata={
+            "user_id": user_id,
+            "session_id": session_id,
+            "question": question[:300],
+        },
+        tags=[f"user:{user_id}", f"session:{session_tag}"],
+    )
+
 
 router = APIRouter(prefix="/api/v1")
 
@@ -98,6 +142,45 @@ LEGAL_ROUTER_HISTORY_TURNS = int(os.getenv("LEGAL_ROUTER_HISTORY_TURNS", "4"))
 LEGAL_ROUTER_HISTORY_CHARS_PER_TURN = int(
     os.getenv("LEGAL_ROUTER_HISTORY_CHARS_PER_TURN", "320")
 )
+RAG_ENABLE_LLM_ROUTER = os.getenv("RAG_ENABLE_LLM_ROUTER", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+RETRIEVAL_HISTORY_USER_TURNS = int(os.getenv("RAG_RETRIEVAL_HISTORY_USER_TURNS", "2"))
+RETRIEVAL_CONTEXT_MAX_CHARS = int(os.getenv("RAG_RETRIEVAL_CONTEXT_MAX_CHARS", "700"))
+RETRIEVAL_REFERENCE_HISTORY_TURNS = int(
+    os.getenv("RAG_RETRIEVAL_REFERENCE_HISTORY_TURNS", "12")
+)
+FOLLOWUP_REFERENCE_PATTERN = re.compile(
+    r"\b(this|that|these|those|it|they|them|same|such|above|below|here|there)\b",
+    re.IGNORECASE,
+)
+EXPLICIT_LEGAL_REFERENCE_PATTERN = re.compile(
+    r"(§\s*\d+[\w.-]*|\bpart\s+\d+[\w-]*\b|\bsubpart\s+[a-z0-9]+\b|\btitle\s+\d+\b|\b\d+\s*cfr\b)",
+    re.IGNORECASE,
+)
+SECTION_NUMERIC_PATTERN = re.compile(r"\b\d{3,4}\.\d{1,3}[a-z]?(?:\([a-z0-9]+\))?\b", re.IGNORECASE)
+LEGAL_KEYWORD_HINTS = (
+    "fhfa",
+    "cfr",
+    "allocation",
+    "targeted fund",
+    "subsidy",
+    "regulation",
+    "rule",
+    "part ",
+    "section",
+    "chapter",
+    "bank",
+)
+RAG_DEBUG_RETRIEVAL_LOGS = os.getenv("RAG_DEBUG_RETRIEVAL_LOGS", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _validate_chat_session_id(session_id: str) -> None:
@@ -196,6 +279,37 @@ def _decide_query_mode_with_llm(
     return mode, reason
 
 
+def _looks_legal_or_doc_query(question: str, history: List[Dict[str, str]]) -> bool:
+    text = (question or "").strip().lower()
+    if not text:
+        return False
+    if EXPLICIT_LEGAL_REFERENCE_PATTERN.search(text):
+        return True
+    if SECTION_NUMERIC_PATTERN.search(text):
+        return True
+    if any(keyword in text for keyword in LEGAL_KEYWORD_HINTS):
+        return True
+    if history and _is_followup_reference_question(text):
+        return True
+    return False
+
+
+def _decide_query_mode(
+    engine: RAGEngine, query: RAGQuery, history: List[Dict[str, str]]
+) -> Tuple[str, str, float]:
+    """Decide routing mode and return (mode, reason, routing_ms)."""
+    if not RAG_ENABLE_LLM_ROUTER:
+        return "rag", "router_disabled", 0.0
+
+    if _looks_legal_or_doc_query(query.question, history):
+        return "rag", "heuristic_legal_query", 0.0
+
+    route_start = time.perf_counter()
+    mode, reason = _decide_query_mode_with_llm(engine, query, history)
+    routing_ms = round((time.perf_counter() - route_start) * 1000, 2)
+    return mode, reason, routing_ms
+
+
 def _build_non_rag_prompt(question: str, mode: str, reason: str) -> str:
     mode_instruction = (
         "Respond helpfully and briefly to the user."
@@ -221,8 +335,80 @@ def _build_non_rag_prompt(question: str, mode: str, reason: str) -> str:
     )
 
 
-def _empty_rag_response(answer: str, llm_provider: LLMProvider, llm_ms: float = 0.0) -> RAGResponse:
-    total_ms = round(llm_ms, 2)
+def _build_missing_reference_anchor_answer() -> str:
+    return (
+        "I need the controlling legal reference to answer this follow-up accurately. "
+        "Please include the exact section/part (for example, `12 CFR §1291.12(c)`), "
+        "or ask this in the same chat after the prior question so I can resolve "
+        "what “same section” refers to."
+    )
+
+
+def _requires_reference_anchor_clarification(
+    question: str, history: List[Dict[str, str]], metadata_filters: Dict[str, Any]
+) -> bool:
+    question_text = (question or "").strip()
+    if not question_text:
+        return False
+    if not _is_followup_reference_question(question_text):
+        return False
+    if EXPLICIT_LEGAL_REFERENCE_PATTERN.search(question_text):
+        return False
+    if metadata_filters:
+        return False
+    history_refs = _recent_reference_turns(
+        history,
+        max_turns=max(RETRIEVAL_REFERENCE_HISTORY_TURNS, LEGAL_ROUTER_HISTORY_TURNS),
+    )
+    return len(history_refs) == 0
+
+
+def _stream_static_text_response(answer: str) -> StreamingResponse:
+    def event_generator():
+        yield answer
+
+    return StreamingResponse(event_generator(), media_type="text/plain")
+
+
+def _sse_static_answer_response(answer: str, label: str = "Clarification needed") -> StreamingResponse:
+    def event_generator():
+        timings = {
+            "routing": 0.0,
+            "embed": 0.0,
+            "search": 0.0,
+            "prompt_build": 0.0,
+            "llm": 0.0,
+            "total": 0.0,
+        }
+        yield _sse_event(
+            "status",
+            {
+                "stage": "generation",
+                "state": "done",
+                "label": label,
+            },
+        )
+        yield _sse_event(
+            "final",
+            {
+                "answer": answer,
+                "timings_ms": timings,
+                "retrieved_count": 0,
+                "prompt_context_count": 0,
+            },
+        )
+        yield _sse_event("done", {})
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+def _empty_rag_response(
+    answer: str,
+    llm_provider: LLMProvider,
+    llm_ms: float = 0.0,
+    routing_ms: float = 0.0,
+) -> RAGResponse:
+    total_ms = round(llm_ms + routing_ms, 2)
     return RAGResponse(
         answer=answer,
         sources=[],
@@ -232,6 +418,7 @@ def _empty_rag_response(answer: str, llm_provider: LLMProvider, llm_ms: float = 
         prompt_context_count=0,
         total_ms=total_ms,
         timings_ms={
+            "routing": round(routing_ms, 2),
             "embed": 0.0,
             "search": 0.0,
             "prompt_build": 0.0,
@@ -248,8 +435,10 @@ def _log_non_rag_query(
     mode: str,
     reason: str,
     llm_ms: float = 0.0,
+    routing_ms: float = 0.0,
 ) -> None:
     try:
+        total_ms = round(llm_ms + routing_ms, 2)
         engine.vector_db.log_query(
             user_id,
             query.question,
@@ -263,11 +452,12 @@ def _log_non_rag_query(
                 "prompt_context_count": 0,
                 "source_id": query.source_id,
                 "timings_ms": {
+                    "routing": round(routing_ms, 2),
                     "embed": 0.0,
                     "search": 0.0,
                     "prompt_build": 0.0,
                     "llm": round(llm_ms, 2),
-                    "total": round(llm_ms, 2),
+                    "total": total_ms,
                 },
                 "prompt_k": RAG_PROMPT_K,
                 "retrieve_k": 0,
@@ -280,6 +470,8 @@ def _log_non_rag_query(
 def _stream_from_provider(engine: RAGEngine, query: RAGQuery, prompt: str):
     if query.llm_provider == LLMProvider.LOCAL:
         return engine._ollama_stream(prompt)
+    if query.llm_provider == LLMProvider.OPENAI:
+        return engine._openai_stream(prompt, temperature=query.temperature)
     if query.llm_provider == LLMProvider.OPENROUTER:
         return engine._openrouter_stream(prompt, temperature=query.temperature)
     raise HTTPException(
@@ -293,12 +485,31 @@ def _streaming_non_rag_response(engine: RAGEngine, query: RAGQuery, prompt: str)
 
 
 def _sse_non_rag_response(
-    engine: RAGEngine, query: RAGQuery, prompt: str, user_id: str, mode: str, reason: str
+    engine: RAGEngine,
+    query: RAGQuery,
+    prompt: str,
+    user_id: str,
+    mode: str,
+    reason: str,
+    routing_ms: float = 0.0,
 ) -> StreamingResponse:
     def event_generator():
         total_start = time.perf_counter()
         answer_parts: List[str] = []
         try:
+            yield _sse_event(
+                "status",
+                {
+                    "stage": "routing",
+                    "state": "done",
+                    "label": "Routing decision complete",
+                    "meta": {
+                        "duration_ms": round(routing_ms, 2),
+                        "route_mode": mode,
+                        "route_reason": reason,
+                    },
+                },
+            )
             yield _sse_event(
                 "status",
                 {
@@ -308,11 +519,12 @@ def _sse_non_rag_response(
                 },
             )
             stream_iter = _stream_from_provider(engine, query, prompt)
-            error_code = (
-                "LOCAL_LLM_ERROR"
-                if query.llm_provider == LLMProvider.LOCAL
-                else "OPENROUTER_STREAM_ERROR"
-            )
+            error_code_map = {
+                LLMProvider.LOCAL: "LOCAL_LLM_ERROR",
+                LLMProvider.OPENAI: "OPENAI_STREAM_ERROR",
+                LLMProvider.OPENROUTER: "OPENROUTER_STREAM_ERROR",
+            }
+            error_code = error_code_map.get(query.llm_provider, "STREAM_ERROR")
             for token in stream_iter:
                 if token and token.lstrip().startswith("[Error]"):
                     yield _sse_event("error", {"code": error_code, "message": token.strip()})
@@ -324,7 +536,16 @@ def _sse_non_rag_response(
 
             llm_ms = round((time.perf_counter() - total_start) * 1000, 2)
             answer = "".join(answer_parts).strip()
-            _log_non_rag_query(engine, user_id, query, mode, reason, llm_ms=llm_ms)
+            _log_non_rag_query(
+                engine,
+                user_id,
+                query,
+                mode,
+                reason,
+                llm_ms=llm_ms,
+                routing_ms=routing_ms,
+            )
+            total_ms = round(llm_ms + routing_ms, 2)
             yield _sse_event(
                 "status",
                 {
@@ -339,11 +560,12 @@ def _sse_non_rag_response(
                 {
                     "answer": answer,
                     "timings_ms": {
+                        "routing": round(routing_ms, 2),
                         "embed": 0.0,
                         "search": 0.0,
                         "prompt_build": 0.0,
                         "llm": llm_ms,
-                        "total": llm_ms,
+                        "total": total_ms,
                     },
                     "retrieved_count": 0,
                     "prompt_context_count": 0,
@@ -357,7 +579,7 @@ def _sse_non_rag_response(
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-    return None
+
 
 
 def _sse_event(event_type: str, data: Dict[str, Any]) -> str:
@@ -636,6 +858,289 @@ def _question_with_conversation_context(
     return (
         f"{preamble}\n\n{history_header}{history_block}{question_header}{question_text}"
     )
+
+
+def _recent_user_turns(
+    history: List[Dict[str, str]], max_turns: int = RETRIEVAL_HISTORY_USER_TURNS
+) -> List[str]:
+    if max_turns <= 0:
+        return []
+    user_turns = [
+        (turn.get("content") or "").strip()
+        for turn in history
+        if turn.get("role") == "user" and (turn.get("content") or "").strip()
+    ]
+    if not user_turns:
+        return []
+    # Keep most recent distinct turns to avoid repeated follow-up loops.
+    distinct_reversed: List[str] = []
+    seen_normalized = set()
+    for text in reversed(user_turns):
+        normalized = text.lower()
+        if normalized in seen_normalized:
+            continue
+        seen_normalized.add(normalized)
+        distinct_reversed.append(text)
+        if len(distinct_reversed) >= max_turns:
+            break
+    return list(reversed(distinct_reversed))
+
+
+def _recent_reference_turns(
+    history: List[Dict[str, str]], max_turns: int = LEGAL_ROUTER_HISTORY_TURNS
+) -> List[str]:
+    if max_turns <= 0:
+        return []
+    reference_turns: List[str] = []
+    for turn in history[-max_turns:]:
+        if turn.get("role") != "user":
+            continue
+        content = (turn.get("content") or "").strip()
+        if not content:
+            continue
+        if EXPLICIT_LEGAL_REFERENCE_PATTERN.search(content):
+            reference_turns.append(content[:RETRIEVAL_CONTEXT_MAX_CHARS])
+    return reference_turns[-max_turns:]
+
+
+def _normalize_conversation_context(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    normalized: List[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        text = value.strip()
+        if text:
+            normalized.append(text[:RETRIEVAL_CONTEXT_MAX_CHARS])
+    return normalized[-RETRIEVAL_HISTORY_USER_TURNS:]
+
+
+def _is_followup_reference_question(question: str) -> bool:
+    text = (question or "").strip()
+    if not text:
+        return False
+    if EXPLICIT_LEGAL_REFERENCE_PATTERN.search(text):
+        return False
+    lower = text.lower()
+    if lower.startswith(("what about", "and ", "does that", "can that")):
+        return True
+    return bool(FOLLOWUP_REFERENCE_PATTERN.search(lower))
+
+
+def _question_for_retrieval(
+    question: str, history: List[Dict[str, str]], conversation_context: Any
+) -> str:
+    question_text = (question or "").strip()
+    if not question_text:
+        return ""
+
+    context_turns = _normalize_conversation_context(conversation_context)
+    if not context_turns:
+        context_turns = _recent_user_turns(history)
+    while context_turns and context_turns[-1].strip().lower() == question_text.lower():
+        context_turns = context_turns[:-1]
+
+    if not context_turns and _is_followup_reference_question(question_text):
+        context_turns = _recent_user_turns(
+            history, max(max(RETRIEVAL_HISTORY_USER_TURNS, 2) + 2, 4)
+        )
+        while (
+            context_turns
+            and context_turns[-1].strip().lower() == question_text.lower()
+        ):
+            context_turns = context_turns[:-1]
+
+    if not context_turns or not _is_followup_reference_question(question_text):
+        return question_text[:RAG_MAX_QUESTION_CHARS]
+
+    anchor = context_turns[-1][:RETRIEVAL_CONTEXT_MAX_CHARS]
+    reference_hints = _recent_reference_turns(history)
+    hints_text = ""
+    if reference_hints:
+        hints_text = (
+            "\n\nRelevant cited references from recent conversation:\n"
+            + "\n".join(reference_hints[-2:])
+        )
+    retrieval_question = (
+        f"Prior user context:\n{anchor}{hints_text}\n\nFollow-up question:\n{question_text}"
+    )
+    return retrieval_question[:RAG_MAX_QUESTION_CHARS]
+
+
+def _merge_metadata_filters(
+    explicit_filters: Optional[Dict[str, Any]],
+    retrieval_question: str,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    def _unique_preserve_order(values: List[str]) -> List[str]:
+        seen = set()
+        ordered: List[str] = []
+        for value in values:
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            ordered.append(value)
+        return ordered
+
+    def _apply_if_missing(key: str, values: List[str]) -> None:
+        if key in filters:
+            return
+        unique_values = _unique_preserve_order(values)
+        if not unique_values:
+            return
+        filters[key] = unique_values[0] if len(unique_values) == 1 else unique_values
+
+    filters: Dict[str, Any] = {}
+    if isinstance(explicit_filters, dict):
+        for key, value in explicit_filters.items():
+            key_text = str(key or "").strip().lower()
+            if not key_text:
+                continue
+            filters[key_text] = value
+
+    def _extract_reference_values(text: str) -> Dict[str, List[str]]:
+        title_values = re.findall(r"\btitle\s+(\d+)\b", text, flags=re.IGNORECASE)
+        chapter_values = [
+            match.upper()
+            for match in re.findall(
+                r"\bchapter\s+([ivxlcdm]+|\d+)\b", text, flags=re.IGNORECASE
+            )
+        ]
+        part_values = [
+            match.lower()
+            for match in re.findall(
+                r"\bpart\s+(\d+[a-z]?)\b", text, flags=re.IGNORECASE
+            )
+        ]
+        section_values = [
+            match.lower()
+            for match in re.findall(r"§\s*([\d.]+[a-z]?)", text, flags=re.IGNORECASE)
+        ]
+        return {
+            "title": title_values,
+            "chapter": chapter_values,
+            "part": part_values,
+            "section": section_values,
+        }
+
+    current_values = _extract_reference_values(retrieval_question or "")
+    current_has_explicit_refs = any(
+        current_values[key] for key in ("title", "chapter", "part", "section")
+    )
+    title_values = current_values["title"]
+    chapter_values = current_values["chapter"]
+    part_values = current_values["part"]
+    section_values = current_values["section"]
+
+    _apply_if_missing("title", title_values)
+    _apply_if_missing("chapter", chapter_values)
+    _apply_if_missing("part", part_values)
+    _apply_if_missing("section", section_values)
+
+    if "part" not in filters and section_values:
+        section_parts = [section.split(".", 1)[0] for section in section_values if "." in section]
+        _apply_if_missing("part", section_parts)
+
+    if history and not current_has_explicit_refs:
+        history_window = history[-max(RETRIEVAL_REFERENCE_HISTORY_TURNS, LEGAL_ROUTER_HISTORY_TURNS) :]
+        history_text = "\n".join(
+            (turn.get("content") or "").strip()[:RETRIEVAL_CONTEXT_MAX_CHARS]
+            for turn in history_window
+            if turn.get("role") == "user" and (turn.get("content") or "").strip()
+        )
+        if history_text:
+            history_values = _extract_reference_values(history_text)
+            _apply_if_missing("title", history_values["title"])
+            _apply_if_missing("chapter", history_values["chapter"])
+            _apply_if_missing("part", history_values["part"])
+            _apply_if_missing("section", history_values["section"])
+            if "part" not in filters and history_values["section"]:
+                section_parts = [
+                    section.split(".", 1)[0]
+                    for section in history_values["section"]
+                    if "." in section
+                ]
+                _apply_if_missing("part", section_parts)
+
+    return filters
+
+
+def _source_metadata_value(source: Dict[str, Any], key: str) -> Optional[str]:
+    chunk_metadata = source.get("chunk_metadata") or {}
+    doc_metadata = source.get("doc_metadata") or {}
+    value = chunk_metadata.get(key)
+    if value in (None, ""):
+        value = doc_metadata.get(key)
+    if value in (None, ""):
+        return None
+    return str(value).strip()
+
+
+def _summarize_retrieval_sources(
+    sources: List[Dict[str, Any]], limit: int = 8
+) -> Dict[str, Any]:
+    part_counts: Dict[str, int] = {}
+    section_counts: Dict[str, int] = {}
+    top_refs: List[Dict[str, Any]] = []
+
+    for source in sources:
+        part = _source_metadata_value(source, "part") or "(none)"
+        section = _source_metadata_value(source, "section") or "(none)"
+        part_counts[part] = part_counts.get(part, 0) + 1
+        section_counts[section] = section_counts.get(section, 0) + 1
+
+    for idx, source in enumerate(sources[: max(limit, 0)], start=1):
+        top_refs.append(
+            {
+                "rank": idx,
+                "chunk_id": source.get("chunk_id"),
+                "part": _source_metadata_value(source, "part"),
+                "section": _source_metadata_value(source, "section"),
+                "heading": _source_metadata_value(source, "heading")
+                or _source_metadata_value(source, "section_header"),
+                "similarity": source.get("similarity"),
+                "lexical_score": source.get("lexical_score"),
+                "hybrid_score": source.get("hybrid_score"),
+            }
+        )
+
+    return {
+        "retrieved_count": len(sources),
+        "part_distribution": part_counts,
+        "section_distribution": section_counts,
+        "top_refs": top_refs,
+    }
+
+
+def _log_retrieval_debug(
+    event: str,
+    query: RAGQuery,
+    retrieval_question: str,
+    metadata_filters: Dict[str, Any],
+    route_mode: str,
+    route_reason: str,
+    history_turns: int,
+    sources: Optional[List[Dict[str, Any]]] = None,
+    timings_ms: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not RAG_DEBUG_RETRIEVAL_LOGS:
+        return
+    payload: Dict[str, Any] = {
+        "event": event,
+        "question": (query.question or "")[:220],
+        "retrieval_question": (retrieval_question or "")[:320],
+        "retrieval_mode": query.retrieval_mode,
+        "metadata_filters": metadata_filters or {},
+        "route_mode": route_mode,
+        "route_reason": route_reason,
+        "history_turns": history_turns,
+    }
+    if sources is not None:
+        payload["retrieval_summary"] = _summarize_retrieval_sources(sources)
+    if timings_ms:
+        payload["timings_ms"] = timings_ms
+    logger.info("[RAG_DEBUG] %s", json.dumps(payload, ensure_ascii=True, default=str))
 
 
 # ---------------------------------------------------------------------------
@@ -1075,26 +1580,101 @@ async def rag_query_endpoint(
     user_id = str(current_user["id"])
     history = _resolve_history_for_query(query, current_user)
     prompt_question = _question_with_conversation_context(query.question, history)
-    route_mode, route_reason = _decide_query_mode_with_llm(engine, query, history)
+    retrieval_question = _question_for_retrieval(
+        query.question, history, query.conversation_context
+    )
+    metadata_filters = _merge_metadata_filters(
+        query.metadata_filters, retrieval_question, history
+    )
+    query_for_rag = query.model_copy(update={"metadata_filters": metadata_filters})
+    if _requires_reference_anchor_clarification(
+        query.question, history, query_for_rag.metadata_filters or {}
+    ):
+        answer = _build_missing_reference_anchor_answer()
+        _log_retrieval_debug(
+            event="query_sync_clarification",
+            query=query,
+            retrieval_question=retrieval_question,
+            metadata_filters=query_for_rag.metadata_filters or {},
+            route_mode="direct",
+            route_reason="missing_reference_anchor",
+            history_turns=len(history),
+        )
+        _log_non_rag_query(
+            engine,
+            user_id,
+            query,
+            "direct",
+            "missing_reference_anchor",
+            llm_ms=0.0,
+            routing_ms=0.0,
+        )
+        return _empty_rag_response(
+            answer,
+            query.llm_provider,
+            llm_ms=0.0,
+            routing_ms=0.0,
+        )
+    route_mode, route_reason, route_ms = _decide_query_mode(engine, query, history)
     if route_mode in {"direct", "deny"}:
         llm_start = time.perf_counter()
         non_rag_prompt = _build_non_rag_prompt(query.question, route_mode, route_reason)
         answer = engine._generate_answer(query, non_rag_prompt)
         llm_ms = round((time.perf_counter() - llm_start) * 1000, 2)
         _log_non_rag_query(
-            engine, user_id, query, route_mode, route_reason, llm_ms=llm_ms
+            engine,
+            user_id,
+            query,
+            route_mode,
+            route_reason,
+            llm_ms=llm_ms,
+            routing_ms=route_ms,
         )
-        return _empty_rag_response(answer, query.llm_provider, llm_ms=llm_ms)
-    try:
-        response = engine.query(query, user_id, prompt_question=prompt_question)
-        logger.info(f"✅ RAG query by {user_id}: {query.question[:50]}...")
-        return response
-    except HTTPException as e:
-        logger.error(f"❌ RAG query failed: {e.detail}")
-        raise e
-    except Exception as e:
-        logger.error(f"❌ RAG query failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return _empty_rag_response(
+            answer,
+            query.llm_provider,
+            llm_ms=llm_ms,
+            routing_ms=route_ms,
+        )
+    with _ls_request_context(user_id, query.session_id, query.question):
+        try:
+            _log_retrieval_debug(
+                event="query_sync_start",
+                query=query,
+                retrieval_question=retrieval_question,
+                metadata_filters=query_for_rag.metadata_filters or {},
+                route_mode=route_mode,
+                route_reason=route_reason,
+                history_turns=len(history),
+            )
+            response = engine.query(
+                query_for_rag,
+                user_id,
+                prompt_question=prompt_question,
+                retrieval_question=retrieval_question,
+            )
+            response.timings_ms["routing"] = round(route_ms, 2)
+            response.total_ms = round(response.total_ms + route_ms, 2)
+            response.timings_ms["total"] = response.total_ms
+            _log_retrieval_debug(
+                event="query_sync_done",
+                query=query,
+                retrieval_question=retrieval_question,
+                metadata_filters=query_for_rag.metadata_filters or {},
+                route_mode=route_mode,
+                route_reason=route_reason,
+                history_turns=len(history),
+                sources=response.sources,
+                timings_ms=response.timings_ms,
+            )
+            logger.info(f"✅ RAG query by {user_id}: {query.question[:50]}...")
+            return response
+        except HTTPException as e:
+            logger.error(f"❌ RAG query failed: {e.detail}")
+            raise e
+        except Exception as e:
+            logger.error(f"❌ RAG query failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/rag/query/stream")
@@ -1102,30 +1682,82 @@ async def rag_query_stream_endpoint(
     query: RAGQuery,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Streaming RAG response (text/plain) for LOCAL and OPENROUTER providers."""
+    """Streaming RAG response (text/plain) for LOCAL, OPENAI, and OPENROUTER providers."""
     user_id = str(current_user["id"])
     history = _resolve_history_for_query(query, current_user)
     prompt_question = _question_with_conversation_context(query.question, history)
-    if query.llm_provider not in {LLMProvider.LOCAL, LLMProvider.OPENROUTER}:
+    retrieval_question = _question_for_retrieval(
+        query.question, history, query.conversation_context
+    )
+    metadata_filters = _merge_metadata_filters(
+        query.metadata_filters, retrieval_question, history
+    )
+    query_for_rag = query.model_copy(update={"metadata_filters": metadata_filters})
+    if query.llm_provider not in {
+        LLMProvider.LOCAL,
+        LLMProvider.OPENAI,
+        LLMProvider.OPENROUTER,
+    }:
         raise HTTPException(
             status_code=400,
-            detail="Streaming is only supported for LOCAL and OPENROUTER providers.",
+            detail="Streaming is only supported for LOCAL, OPENAI, and OPENROUTER providers.",
         )
 
     engine = get_rag_engine()
 
     classifications = query.classification_filter or [DataClassification.PUBLIC]
     engine._validate_llm_access(query.llm_provider, classifications)
-    route_mode, route_reason = _decide_query_mode_with_llm(engine, query, history)
+    if _requires_reference_anchor_clarification(
+        query.question, history, query_for_rag.metadata_filters or {}
+    ):
+        answer = _build_missing_reference_anchor_answer()
+        _log_retrieval_debug(
+            event="query_stream_clarification",
+            query=query,
+            retrieval_question=retrieval_question,
+            metadata_filters=query_for_rag.metadata_filters or {},
+            route_mode="direct",
+            route_reason="missing_reference_anchor",
+            history_turns=len(history),
+        )
+        _log_non_rag_query(
+            engine,
+            user_id,
+            query,
+            "direct",
+            "missing_reference_anchor",
+            llm_ms=0.0,
+            routing_ms=0.0,
+        )
+        return _stream_static_text_response(answer)
+    route_mode, route_reason, route_ms = _decide_query_mode(engine, query, history)
     if route_mode in {"direct", "deny"}:
         non_rag_prompt = _build_non_rag_prompt(query.question, route_mode, route_reason)
-        _log_non_rag_query(engine, user_id, query, route_mode, route_reason, llm_ms=0.0)
+        _log_non_rag_query(
+            engine,
+            user_id,
+            query,
+            route_mode,
+            route_reason,
+            llm_ms=0.0,
+            routing_ms=route_ms,
+        )
         return _streaming_non_rag_response(engine, query, non_rag_prompt)
+
+    _log_retrieval_debug(
+        event="query_stream_start",
+        query=query,
+        retrieval_question=retrieval_question,
+        metadata_filters=query_for_rag.metadata_filters or {},
+        route_mode=route_mode,
+        route_reason=route_reason,
+        history_turns=len(history),
+    )
 
     if engine.vectorization is None:
         engine.vectorization = VectorizationEngine(DEFAULT_EMBEDDING_MODEL)
     embed_start = time.perf_counter()
-    query_embedding = engine.get_query_embedding(query.question)
+    query_embedding = engine.get_query_embedding(retrieval_question)
     embed_ms = round((time.perf_counter() - embed_start) * 1000, 2)
 
     search_start = time.perf_counter()
@@ -1135,16 +1767,62 @@ async def rag_query_stream_endpoint(
         min(max(query.top_k, 1), RAG_RETRIEVE_K),
         query.min_similarity,
         source_id=query.source_id,
+        query_text=retrieval_question,
+        metadata_filters=query_for_rag.metadata_filters,
+        retrieval_mode=query.retrieval_mode,
     )
     search_ms = round((time.perf_counter() - search_start) * 1000, 2)
 
     if not results:
-        raise HTTPException(status_code=404, detail="No relevant documents found")
+        # Cannot-answer fallback (Decision 1) — text stream path
+        caveat = (
+            "⚠️ I have not been trained on this question. The following answer is "
+            "ungrounded — it comes from the LLM's general knowledge and may be "
+            "incorrect for your regulatory context.\n\n"
+        )
+        ungrounded_prompt = RAGEngine._build_ungrounded_prompt(prompt_question)
+        engine.vector_db.log_query(
+            user_id, query.question, query.llm_provider.value,
+            DataClassification.PUBLIC.value, True,
+            details={"retrieved_count": 0, "ungrounded": True},
+        )
 
-    max_class = engine._get_max_classification([r["classification"] for r in results])
+        def _ungrounded_stream():
+            yield caveat
+            if query.llm_provider == LLMProvider.LOCAL:
+                yield from engine._ollama_stream(ungrounded_prompt)
+            elif query.llm_provider == LLMProvider.OPENAI:
+                yield from engine._openai_stream(
+                    ungrounded_prompt, temperature=query.temperature
+                )
+            else:
+                yield from engine._openrouter_stream(
+                    ungrounded_prompt, temperature=query.temperature
+                )
+
+        return StreamingResponse(_ungrounded_stream(), media_type="text/plain")
 
     prompt, prompt_context_count = engine._build_prompt(prompt_question, results)
+    timings_for_debug = {
+        "routing": round(route_ms, 2),
+        "embed": embed_ms,
+        "search": search_ms,
+    }
+    _log_retrieval_debug(
+        event="query_stream_retrieval_done",
+        query=query,
+        retrieval_question=retrieval_question,
+        metadata_filters=query_for_rag.metadata_filters or {},
+        route_mode=route_mode,
+        route_reason=route_reason,
+        history_turns=len(history),
+        sources=results,
+        timings_ms=timings_for_debug,
+    )
 
+    max_class = engine._get_max_classification(
+        [r["classification"] for r in results]
+    )
     engine.vector_db.log_query(
         user_id,
         query.question,
@@ -1159,11 +1837,18 @@ async def rag_query_stream_endpoint(
             "prompt_k": RAG_PROMPT_K,
             "retrieve_k": RAG_RETRIEVE_K,
             "history_turn_count": len(history),
+            "retrieval_mode": query.retrieval_mode,
+            "metadata_filters": query_for_rag.metadata_filters or {},
+            "routing_ms": round(route_ms, 2),
+            "retrieval_question": retrieval_question,
+            "retrieval_debug": engine._build_retrieval_debug(results, limit=8),
         },
     )
 
     if query.llm_provider == LLMProvider.LOCAL:
         token_stream = engine._ollama_stream(prompt)
+    elif query.llm_provider == LLMProvider.OPENAI:
+        token_stream = engine._openai_stream(prompt, temperature=query.temperature)
     else:
         token_stream = engine._openrouter_stream(prompt, temperature=query.temperature)
 
@@ -1180,31 +1865,100 @@ async def rag_query_stream_events_endpoint(
     Event envelope:
       {"type": "...", "data": {...}}
     """
-    if query.llm_provider not in {LLMProvider.LOCAL, LLMProvider.OPENROUTER}:
+    if query.llm_provider not in {
+        LLMProvider.LOCAL,
+        LLMProvider.OPENAI,
+        LLMProvider.OPENROUTER,
+    }:
         raise HTTPException(
             status_code=400,
-            detail="Structured streaming is only supported for LOCAL and OPENROUTER providers.",
+            detail="Structured streaming is only supported for LOCAL, OPENAI, and OPENROUTER providers.",
         )
 
     engine = get_rag_engine()
     user_id = str(current_user["id"])
     history = _resolve_history_for_query(query, current_user)
     prompt_question = _question_with_conversation_context(query.question, history)
+    retrieval_question = _question_for_retrieval(
+        query.question, history, query.conversation_context
+    )
+    metadata_filters = _merge_metadata_filters(
+        query.metadata_filters, retrieval_question, history
+    )
+    query_for_rag = query.model_copy(update={"metadata_filters": metadata_filters})
     classifications = query.classification_filter or [DataClassification.PUBLIC]
     engine._validate_llm_access(query.llm_provider, classifications)
-    route_mode, route_reason = _decide_query_mode_with_llm(engine, query, history)
+    if _requires_reference_anchor_clarification(
+        query.question, history, query_for_rag.metadata_filters or {}
+    ):
+        answer = _build_missing_reference_anchor_answer()
+        _log_retrieval_debug(
+            event="query_sse_clarification",
+            query=query,
+            retrieval_question=retrieval_question,
+            metadata_filters=query_for_rag.metadata_filters or {},
+            route_mode="direct",
+            route_reason="missing_reference_anchor",
+            history_turns=len(history),
+        )
+        _log_non_rag_query(
+            engine,
+            user_id,
+            query,
+            "direct",
+            "missing_reference_anchor",
+            llm_ms=0.0,
+            routing_ms=0.0,
+        )
+        return _sse_static_answer_response(answer)
+    route_mode, route_reason, route_ms = _decide_query_mode(engine, query, history)
     if route_mode in {"direct", "deny"}:
         non_rag_prompt = _build_non_rag_prompt(query.question, route_mode, route_reason)
         return _sse_non_rag_response(
-            engine, query, non_rag_prompt, user_id, route_mode, route_reason
+            engine,
+            query,
+            non_rag_prompt,
+            user_id,
+            route_mode,
+            route_reason,
+            routing_ms=route_ms,
         )
 
+    _log_retrieval_debug(
+        event="query_sse_start",
+        query=query,
+        retrieval_question=retrieval_question,
+        metadata_filters=query_for_rag.metadata_filters or {},
+        route_mode=route_mode,
+        route_reason=route_reason,
+        history_turns=len(history),
+    )
+
     def event_generator():
+        # Enter LangSmith parent span — all @traceable child calls nest under it.
+        _ls_ctx = _ls_request_context(user_id, query.session_id, query.question)
+        _ls_ctx.__enter__()
+        _ls_exc: tuple = (None, None, None)
         total_start = time.perf_counter()
         timings_ms: Dict[str, float] = {}
         try:
             if engine.vectorization is None:
                 engine.vectorization = VectorizationEngine(DEFAULT_EMBEDDING_MODEL)
+
+            timings_ms["routing"] = round(route_ms, 2)
+            yield _sse_event(
+                "status",
+                {
+                    "stage": "routing",
+                    "state": "done",
+                    "label": "Routing decision complete",
+                    "meta": {
+                        "duration_ms": round(route_ms, 2),
+                        "route_mode": route_mode,
+                        "route_reason": route_reason,
+                    },
+                },
+            )
 
             yield _sse_event(
                 "status",
@@ -1215,7 +1969,7 @@ async def rag_query_stream_events_endpoint(
                 },
             )
             embed_start = time.perf_counter()
-            query_embedding = engine.get_query_embedding(query.question)
+            query_embedding = engine.get_query_embedding(retrieval_question)
             embed_ms = round((time.perf_counter() - embed_start) * 1000, 2)
             timings_ms["embed"] = embed_ms
             yield _sse_event(
@@ -1239,6 +1993,9 @@ async def rag_query_stream_events_endpoint(
                         "retrieve_k": retrieval_k,
                         "min_similarity": query.min_similarity,
                         "source_id": query.source_id,
+                        "retrieval_mode": query.retrieval_mode,
+                        "applied_filters": query_for_rag.metadata_filters or {},
+                        "retrieval_question_preview": retrieval_question[:220],
                     },
                 },
             )
@@ -1249,18 +2006,108 @@ async def rag_query_stream_events_endpoint(
                 retrieval_k,
                 query.min_similarity,
                 source_id=query.source_id,
+                query_text=retrieval_question,
+                metadata_filters=query_for_rag.metadata_filters,
+                retrieval_mode=query.retrieval_mode,
             )
             search_ms = round((time.perf_counter() - search_start) * 1000, 2)
             timings_ms["search"] = search_ms
 
             if not results:
+                # Cannot-answer fallback (Decision 1) — SSE path
+                ug_ticket_url = RAGEngine._create_zammad_ticket(query.question)
+                caveat_text = (
+                    "⚠️ I have not been trained on this question. The following answer is "
+                    "ungrounded — it comes from the LLM's general knowledge and may be "
+                    "incorrect for your regulatory context.\n\n"
+                )
+                ungrounded_prompt = RAGEngine._build_ungrounded_prompt(prompt_question)
                 yield _sse_event(
-                    "error",
-                    {"code": "NO_RESULTS", "message": "No relevant documents found"},
+                    "status",
+                    {
+                        "stage": "retrieval",
+                        "state": "done",
+                        "label": "No documents found — falling back to ungrounded answer",
+                        "meta": {"retrieved_count": 0},
+                    },
+                )
+                yield _sse_event(
+                    "status",
+                    {"stage": "generation", "state": "start", "label": "Generating ungrounded answer"},
+                )
+                yield _sse_event("token", {"text": caveat_text})
+                ug_answer_parts: List[str] = [caveat_text]
+                ug_llm_start = time.perf_counter()
+                if query.llm_provider == LLMProvider.LOCAL:
+                    ug_stream_iter = engine._ollama_stream(ungrounded_prompt)
+                    ug_error_code = "LOCAL_LLM_ERROR"
+                elif query.llm_provider == LLMProvider.OPENAI:
+                    ug_stream_iter = engine._openai_stream(
+                        ungrounded_prompt, temperature=query.temperature
+                    )
+                    ug_error_code = "OPENAI_STREAM_ERROR"
+                else:
+                    ug_stream_iter = engine._openrouter_stream(
+                        ungrounded_prompt, temperature=query.temperature
+                    )
+                    ug_error_code = "OPENROUTER_STREAM_ERROR"
+                for token in ug_stream_iter:
+                    if token and token.lstrip().startswith("[Error]"):
+                        yield _sse_event("error", {"code": ug_error_code, "message": token.strip()})
+                        yield _sse_event("done", {})
+                        return
+                    if token:
+                        ug_answer_parts.append(token)
+                        yield _sse_event("token", {"text": token})
+                ug_llm_ms = round((time.perf_counter() - ug_llm_start) * 1000, 2)
+                ug_total_ms = round((time.perf_counter() - total_start) * 1000, 2)
+                timings_ms.update(
+                    {"prompt_build": 0.0, "llm": ug_llm_ms, "total": ug_total_ms}
+                )
+                engine.vector_db.log_query(
+                    user_id, query.question, query.llm_provider.value,
+                    DataClassification.PUBLIC.value, True,
+                    details={"retrieved_count": 0, "ungrounded": True, "timings_ms": timings_ms},
+                )
+                yield _sse_event(
+                    "status",
+                    {
+                        "stage": "generation",
+                        "state": "done",
+                        "label": "Ungrounded answer complete",
+                        "meta": {"duration_ms": ug_llm_ms},
+                    },
+                )
+                yield _sse_event(
+                    "final",
+                    {
+                        "answer": "".join(ug_answer_parts).strip(),
+                        "timings_ms": timings_ms,
+                        "retrieved_count": 0,
+                        "prompt_context_count": 0,
+                        "is_grounded": False,
+                        "ticket_link": ug_ticket_url,
+                    },
                 )
                 yield _sse_event("done", {})
                 return
 
+            retrieval_debug = engine._build_retrieval_debug(results, limit=8)
+            _log_retrieval_debug(
+                event="query_sse_retrieval_done",
+                query=query,
+                retrieval_question=retrieval_question,
+                metadata_filters=query_for_rag.metadata_filters or {},
+                route_mode=route_mode,
+                route_reason=route_reason,
+                history_turns=len(history),
+                sources=results,
+                timings_ms={
+                    "routing": round(route_ms, 2),
+                    "embed": embed_ms,
+                    "search": search_ms,
+                },
+            )
             for idx, result in enumerate(results, start=1):
                 yield _sse_event("source", _build_source_event(result, idx))
 
@@ -1270,7 +2117,11 @@ async def rag_query_stream_events_endpoint(
                     "stage": "retrieval",
                     "state": "done",
                     "label": "Relevant chunks retrieved",
-                    "meta": {"duration_ms": search_ms, "retrieved_count": len(results)},
+                    "meta": {
+                        "duration_ms": search_ms,
+                        "retrieved_count": len(results),
+                        "part_distribution": retrieval_debug.get("part_distribution", {}),
+                    },
                 },
             )
 
@@ -1313,9 +2164,14 @@ async def rag_query_stream_events_endpoint(
 
             llm_start = time.perf_counter()
             answer_parts: List[str] = []
+            first_token_ms: Optional[float] = None
+            output_chunks = 0
             if query.llm_provider == LLMProvider.LOCAL:
                 stream_iter = engine._ollama_stream(prompt)
                 error_code = "LOCAL_LLM_ERROR"
+            elif query.llm_provider == LLMProvider.OPENAI:
+                stream_iter = engine._openai_stream(prompt, temperature=query.temperature)
+                error_code = "OPENAI_STREAM_ERROR"
             else:
                 stream_iter = engine._openrouter_stream(
                     prompt, temperature=query.temperature
@@ -1339,11 +2195,19 @@ async def rag_query_stream_events_endpoint(
                     return
 
                 if token:
+                    if first_token_ms is None:
+                        first_token_ms = round(
+                            (time.perf_counter() - llm_start) * 1000, 2
+                        )
                     answer_parts.append(token)
+                    output_chunks += 1
                     yield _sse_event("token", {"text": token})
 
             llm_ms = round((time.perf_counter() - llm_start) * 1000, 2)
             timings_ms["llm"] = llm_ms
+            if first_token_ms is not None:
+                timings_ms["llm_first_token"] = first_token_ms
+            timings_ms["llm_output_chunks"] = float(output_chunks)
 
             answer = "".join(answer_parts).strip()
             total_ms = round((time.perf_counter() - total_start) * 1000, 2)
@@ -1367,7 +2231,24 @@ async def rag_query_stream_events_endpoint(
                     "prompt_k": RAG_PROMPT_K,
                     "retrieve_k": RAG_RETRIEVE_K,
                     "history_turn_count": len(history),
+                    "retrieval_mode": query.retrieval_mode,
+                    "metadata_filters": query_for_rag.metadata_filters or {},
+                    "retrieval_question": retrieval_question,
+                    "retrieval_debug": retrieval_debug,
+                    "route_mode": route_mode,
+                    "route_reason": route_reason,
                 },
+            )
+            _log_retrieval_debug(
+                event="query_sse_done",
+                query=query,
+                retrieval_question=retrieval_question,
+                metadata_filters=query_for_rag.metadata_filters or {},
+                route_mode=route_mode,
+                route_reason=route_reason,
+                history_turns=len(history),
+                sources=results,
+                timings_ms=timings_ms,
             )
 
             yield _sse_event(
@@ -1376,7 +2257,11 @@ async def rag_query_stream_events_endpoint(
                     "stage": "generation",
                     "state": "done",
                     "label": "Generation complete",
-                    "meta": {"duration_ms": llm_ms},
+                    "meta": {
+                        "duration_ms": llm_ms,
+                        "first_token_ms": first_token_ms,
+                        "output_chunks": output_chunks,
+                    },
                 },
             )
             yield _sse_event(
@@ -1386,13 +2271,81 @@ async def rag_query_stream_events_endpoint(
                     "timings_ms": timings_ms,
                     "retrieved_count": len(results),
                     "prompt_context_count": prompt_context_count,
+                    "is_grounded": True,
+                    "ticket_link": None,
                 },
             )
             yield _sse_event("done", {})
         except Exception as e:
+            import sys
+            _ls_exc = sys.exc_info()
             logger.error(f"❌ Structured stream failed: {e}")
             yield _sse_event("error", {"code": "STREAM_FAILURE", "message": str(e)})
             yield _sse_event("done", {})
+        finally:
+            # Close LangSmith parent span, forwarding exception info if present.
+            _ls_ctx.__exit__(*_ls_exc)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# Agent endpoint — LangChain tool-calling agent with Zammad + report gen
+# ---------------------------------------------------------------------------
+
+
+@router.post("/rag/agent/stream/events")
+async def rag_agent_stream_events(
+    query: RAGQuery,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    SSE endpoint backed by a LangChain tool-calling agent.
+
+    The agent dynamically decides between:
+      1. knowledge_base_search → grounded answer
+      2. create_zammad_ticket + ungrounded LLM → when KB has no data
+      3. generate_report → structured markdown report on demand
+
+    SSE event types: status | tool_call | tool_result | token | final | done | error
+    """
+    from app.rag.agent import run_agent_stream
+
+    vector_db = get_vector_db()
+    user_id = str(current_user["id"])
+
+    if not query.question or not query.question.strip():
+        raise HTTPException(status_code=422, detail="question is required")
+
+    question = query.question.strip()[:RAG_MAX_QUESTION_CHARS]
+
+    async def event_generator():
+        _ls_ctx = _ls_request_context(user_id, query.session_id, question)
+        _ls_ctx.__enter__()
+        _ls_exc: tuple = (None, None, None)
+        yield _sse_event(
+            "status",
+            {"stage": "agent", "state": "start", "label": "Agent thinking…"},
+        )
+        try:
+            async for event_type, data in run_agent_stream(
+                question=question,
+                vector_db=vector_db,
+                llm_provider=query.llm_provider,
+                user_id=user_id,
+                source_id=query.source_id,
+            ):
+                yield _sse_event(event_type, data)
+                if event_type in ("final", "error"):
+                    break
+        except Exception as exc:
+            import sys
+            _ls_exc = sys.exc_info()
+            logger.error("Agent stream error: %s", exc)
+            yield _sse_event("error", {"code": "AGENT_FAILURE", "message": str(exc)})
+        finally:
+            yield _sse_event("done", {})
+            _ls_ctx.__exit__(*_ls_exc)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -1503,3 +2456,237 @@ async def get_audit_log(limit: int = 100):
         cur.close()
 
     return {"logs": logs, "total": len(logs)}
+
+
+# ---------------------------------------------------------------------------
+# eCFR Chapter Ingestion (Decision 3)
+# User-accessible endpoint that ports the CLI script to an HTTP endpoint.
+# ---------------------------------------------------------------------------
+
+
+def _ecfr_find_chapter(title_json: Dict, chapter_id: str) -> Optional[Dict]:
+    """Walk eCFR title structure JSON to find a chapter node by identifier."""
+    for child in title_json.get("children", []):
+        if child.get("type") == "chapter" and child.get("identifier") == chapter_id:
+            return child
+    return None
+
+
+def _ecfr_collect_parts(node: Dict) -> List[str]:
+    """Recursively collect part identifiers from a chapter node."""
+    parts: List[str] = []
+    seen: set = set()
+
+    def _walk(n: Dict) -> None:
+        if isinstance(n, dict):
+            if n.get("type") == "part" and n.get("identifier"):
+                ident = str(n["identifier"])
+                if ident not in seen:
+                    seen.add(ident)
+                    parts.append(ident)
+            for child in n.get("children", []) or []:
+                _walk(child)
+
+    _walk(node)
+    return parts
+
+
+def _ecfr_iter_sections(title: int, date: str, part: str) -> Iterator[Dict]:
+    """
+    Fetch full XML from ecfr.gov for a title/date/part and yield
+    {section, heading, content} dicts for each SECTION div found.
+    """
+    url = (
+        f"https://www.ecfr.gov/api/versioner/v1/full/{date}/title-{title}.xml"
+        f"?part={part}"
+    )
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    xml_root = ET.fromstring(resp.text)
+    for div in xml_root.iter():
+        if div.tag.startswith("DIV") and div.attrib.get("TYPE") == "SECTION":
+            head = div.find("HEAD")
+            text_parts: List[str] = []
+            if head is not None and head.text:
+                text_parts.append(head.text.strip())
+            for p in div.findall("P"):
+                p_text = "".join(p.itertext()).strip()
+                if p_text:
+                    text_parts.append(p_text)
+            content = "\n".join(text_parts).strip()
+            if not content:
+                continue
+            yield {
+                "section": div.attrib.get("N", ""),
+                "heading": head.text.strip() if (head is not None and head.text) else "",
+                "content": content,
+            }
+
+
+@router.post("/rag/ticket", response_model=TicketCreateResponse, status_code=201)
+async def create_training_ticket(
+    payload: TicketCreateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """User-initiated training request — creates a Zammad ticket with the unanswered question."""
+    from app.config import ZAMMAD_URL, ZAMMAD_TOKEN, ZAMMAD_GROUP, ZAMMAD_DEFAULT_CUSTOMER
+
+    if not ZAMMAD_URL or not ZAMMAD_TOKEN:
+        raise HTTPException(status_code=503, detail="Ticketing system not configured")
+
+    priority_map = {"low": 1, "normal": 2, "high": 3}
+    body_lines = [
+        f"The RAG chatbot could not answer the following question:\n\nQuestion: {payload.question}",
+    ]
+    if payload.notes:
+        body_lines.append(f"\nAdditional context from user:\n{payload.notes}")
+    body_lines.append("\nPlease add relevant training data to the knowledge base.")
+
+    try:
+        resp = requests.post(
+            f"{ZAMMAD_URL.rstrip('/')}/api/v1/tickets",
+            json={
+                "title": f"Training request: {payload.question[:80]}",
+                "group": ZAMMAD_GROUP,
+                "customer": ZAMMAD_DEFAULT_CUSTOMER,
+                "priority_id": priority_map.get(payload.priority, 2),
+                "article": {
+                    "subject": "Knowledge gap — user-submitted training request",
+                    "body": "\n".join(body_lines),
+                    "type": "note",
+                    "internal": False,
+                },
+            },
+            headers={
+                "Authorization": f"Token token={ZAMMAD_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        ticket_id = data.get("id")
+        if not ticket_id:
+            raise HTTPException(status_code=502, detail="Zammad did not return a ticket ID")
+        return TicketCreateResponse(
+            ticket_id=ticket_id,
+            ticket_url=f"{ZAMMAD_URL.rstrip('/')}/#ticket/zoom/{ticket_id}",
+            title=data.get("title", ""),
+        )
+    except requests.exceptions.RequestException as exc:
+        logger.error(f"Zammad ticket creation failed: {exc}")
+        raise HTTPException(status_code=502, detail=f"Ticketing system error: {exc}")
+
+
+@router.post(
+    "/ingest/ecfr-chapter",
+    response_model=IngestEcfrChapterResponse,
+    status_code=202,
+)
+async def ingest_ecfr_chapter(
+    payload: IngestEcfrChapterRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Fetch and ingest an eCFR chapter into the vector store (Decision 3).
+
+    Authenticated endpoint — any logged-in user may trigger ingestion.
+    After ingestion, call POST /api/v1/workflow/complete?source_id=<source_id>
+    to chunk and embed the newly inserted documents.
+    """
+    vector_db = get_vector_db()
+    date_str = payload.date if payload.date.lower() != "current" else "current"
+
+    # 1. Fetch chapter structure from eCFR
+    structure_url = (
+        f"https://www.ecfr.gov/api/versioner/v1/structure/{date_str}"
+        f"/title-{payload.title}.json"
+    )
+    try:
+        struct_resp = requests.get(structure_url, timeout=60)
+        struct_resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch eCFR structure: {exc}",
+        )
+
+    title_json = struct_resp.json()
+    chapter_node = _ecfr_find_chapter(title_json, payload.chapter)
+    if not chapter_node:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Chapter {payload.chapter} not found in title {payload.title}.",
+        )
+
+    parts = _ecfr_collect_parts(chapter_node)
+    if not parts:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No parts found under chapter {payload.chapter}.",
+        )
+
+    source_id = (
+        payload.source_id
+        or f"ecfr-title-{payload.title}-chapter-{payload.chapter.lower()}"
+    )
+
+    # 2. Insert sections into the documents table
+    inserted = 0
+    with vector_db.get_connection() as conn:
+        with conn.cursor() as cur:
+            for part in parts:
+                try:
+                    for section in _ecfr_iter_sections(payload.title, date_str, part):
+                        doc_id = str(uuid.uuid4())
+                        metadata = {
+                            "title": payload.title,
+                            "chapter": payload.chapter,
+                            "part": part,
+                            "section": section["section"],
+                            "heading": section["heading"],
+                            "type": "SECTION",
+                            "source": "ecfr",
+                            "date": date_str,
+                        }
+                        cur.execute(
+                            """
+                            INSERT INTO documents
+                                (id, source_id, content, metadata, classification,
+                                 status, pii_detected)
+                            VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (
+                                doc_id,
+                                source_id,
+                                section["content"],
+                                json.dumps(metadata),
+                                payload.classification.value,
+                                "approved",  # 'approved' so workflow/complete vectorizes them
+                                False,
+                            ),
+                        )
+                        inserted += 1
+                except requests.exceptions.RequestException as exc:
+                    logger.warning(
+                        f"[ingest_ecfr_chapter] Skipping part {part} — fetch failed: {exc}"
+                    )
+                    continue
+        conn.commit()
+
+    logger.info(
+        f"[ingest_ecfr_chapter] user={current_user['id']} "
+        f"source_id={source_id} inserted={inserted} parts={parts}"
+    )
+
+    return IngestEcfrChapterResponse(
+        source_id=source_id,
+        inserted_documents=inserted,
+        parts_processed=parts,
+        message=(
+            f"Successfully ingested {inserted} sections from chapter "
+            f"{payload.chapter} (title {payload.title}) into source '{source_id}'. "
+            f"Call POST /api/v1/workflow/complete?source_id={source_id} to vectorize."
+        ),
+    )

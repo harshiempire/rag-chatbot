@@ -4,7 +4,7 @@ import type { ChatEvent } from '../types/chat';
 const statusEventSchema = z.object({
   type: z.literal('status'),
   data: z.object({
-    stage: z.enum(['embedding', 'retrieval', 'prompt_build', 'generation']),
+    stage: z.enum(['routing', 'embedding', 'retrieval', 'prompt_build', 'generation']),
     state: z.enum(['start', 'done']),
     label: z.string(),
     meta: z.any().optional(),
@@ -36,6 +36,9 @@ const finalEventSchema = z.object({
     timings_ms: z.record(z.number()),
     retrieved_count: z.number(),
     prompt_context_count: z.number(),
+    // Grounding state — Decision 1
+    is_grounded: z.boolean().optional(),
+    ticket_link: z.string().nullable().optional(),
   }),
 });
 

@@ -11,7 +11,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router, init_services
-from app.config import CORS_ALLOW_ORIGINS, DATABASE_URL
+from app.config import (
+    CORS_ALLOW_ORIGINS,
+    DATABASE_URL,
+    LANGSMITH_API_KEY,
+    LANGSMITH_PROJECT,
+    LANGSMITH_TRACING_ENABLED,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -41,6 +47,16 @@ app.include_router(router)
 @app.on_event("startup")
 async def startup():
     """Initialize services on application startup"""
+    # LangSmith tracing — must be set before any LangChain usage (Decision 2)
+    if LANGSMITH_TRACING_ENABLED and LANGSMITH_API_KEY:
+        import os as _os
+        _os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        _os.environ["LANGCHAIN_API_KEY"] = LANGSMITH_API_KEY
+        _os.environ["LANGCHAIN_PROJECT"] = LANGSMITH_PROJECT
+        logger.info(f"🔍 LangSmith tracing enabled — project: {LANGSMITH_PROJECT}")
+    else:
+        logger.info("LangSmith tracing disabled (set LANGSMITH_TRACING=true to enable).")
+
     init_services(DATABASE_URL)
     logger.info("✅ Application started")
 

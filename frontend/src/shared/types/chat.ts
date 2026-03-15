@@ -1,7 +1,7 @@
 export type LLMProvider = 'openai' | 'anthropic' | 'google' | 'openrouter' | 'local';
 export type DataClassification = 'public' | 'internal' | 'confidential' | 'restricted';
 
-export type PipelineStage = 'embedding' | 'retrieval' | 'prompt_build' | 'generation';
+export type PipelineStage = 'routing' | 'embedding' | 'retrieval' | 'prompt_build' | 'generation';
 export type PipelineState = 'start' | 'done';
 
 export interface PipelineStatusItem {
@@ -55,6 +55,9 @@ export interface FinalEvent {
     timings_ms: Record<string, number>;
     retrieved_count: number;
     prompt_context_count: number;
+    /** false when RAG found no documents and fell back to an ungrounded LLM response (Decision 1) */
+    is_grounded?: boolean;
+    ticket_link?: string | null;
   };
 }
 
@@ -83,6 +86,9 @@ export interface RAGStreamRequest {
   min_similarity: number;
   session_id?: string;
   chat_history?: ChatHistoryTurn[];
+  conversation_context?: string[];
+  metadata_filters?: Record<string, string | string[]>;
+  retrieval_mode?: 'dense' | 'hybrid';
 }
 
 export interface ChatHistoryTurn {
@@ -100,6 +106,13 @@ export interface ChatMessage {
   sources?: ChatSource[];
   statusHistory?: PipelineStatusItem[];
   usage?: ChatUsage;
+  /** false when this response is ungrounded (RAG found no documents) — Decision 1 */
+  isGrounded?: boolean;
+  ticketLink?: string | null;
+  /** the original user question that triggered the ungrounded response */
+  originalQuestion?: string;
+  /** populated after the user successfully submits a training ticket for this message */
+  submittedTicket?: { id: number; url: string };
 }
 
 export interface ChatSession {
