@@ -2086,7 +2086,7 @@ async def rag_query_stream_events_endpoint(
                         "retrieved_count": 0,
                         "prompt_context_count": 0,
                         "is_grounded": False,
-                        "ticket_link": None,
+                        "ticket_link": ug_ticket_url,
                     },
                 )
                 yield _sse_event("done", {})

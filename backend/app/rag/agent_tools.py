@@ -59,7 +59,7 @@ def make_tools(
 
         lines = [f"Found {len(results)} document(s):\n"]
         for i, r in enumerate(results, 1):
-            meta = r.get("metadata", {})
+            meta = r.get("chunk_metadata", {}) or r.get("doc_metadata", {})
             heading = meta.get("heading", meta.get("section", f"doc-{i}"))
             content = r.get("content", "")[:600]
             lines.append(f"[{i}] {heading}\n{content}\n")
@@ -99,7 +99,7 @@ def make_tools(
             f"*Based on {len(results)} document(s) from the knowledge base.*\n",
         ]
         for r in results:
-            meta = r.get("metadata", {})
+            meta = r.get("chunk_metadata", {}) or r.get("doc_metadata", {})
             heading = meta.get("heading", meta.get("section", "Unknown"))
             content = r.get("content", "")[:800]
             part = meta.get("part", "")
