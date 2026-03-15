@@ -40,7 +40,7 @@ def make_tools(
         return vector_db.similarity_search(
             embedding,
             [DataClassification.PUBLIC.value],
-            k=_TOOL_RETRIEVE_K,
+            top_k=_TOOL_RETRIEVE_K,
             min_similarity=_TOOL_MIN_SIMILARITY,
             source_id=source_id,
             query_text=query.strip()[:500],
