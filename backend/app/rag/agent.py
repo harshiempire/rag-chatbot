@@ -48,8 +48,14 @@ TOOLS (use each at most once per turn):
 
 EXACT WORKFLOW — follow these steps in order, no deviations:
 
-Step 1 — Search (do this exactly once):
-  Call knowledge_base_search with the user's question. Do NOT call it again.
+Step 1 — Search (choose ONE branch, then proceed to Step 2):
+
+  Branch R — Report request (user explicitly says "report", "summary", or "overview"):
+    Call generate_report with the user's question. Skip the other branch entirely.
+
+  Branch S — All other questions:
+    Call knowledge_base_search with the user's question. Do this EXACTLY ONCE.
+    Do NOT also call generate_report.
 
 Step 2 — Decide based on the tool output:
 
@@ -71,8 +77,8 @@ Step 2 — Decide based on the tool output:
       The user interface will automatically display a disclaimer banner.
     • Be concise and factual; note that official sources should be consulted.
 
-IMPORTANT: Never call knowledge_base_search more than once. Never call generate_report \
-unless the user explicitly asked for a report/summary/overview.
+IMPORTANT: Never call knowledge_base_search more than once per turn. \
+Each branch in Step 1 is mutually exclusive — call exactly one tool in Step 1, never both.
 """
 
 _TICKET_URL_RE = re.compile(r"TICKET_CREATED:\s*(https?://\S+)")
@@ -244,6 +250,19 @@ async def run_agent_stream(
                         "discarding %d chars of inter-tool tokens",
                         tool_name, len(full_answer),
                     )
+                    # Close the open generation/start with a matching generation/done
+                    # so the frontend statusHistory never has a dangling in-progress
+                    # "Generating answer" step when additional tools are called.
+                    yield "status", {
+                        "stage": "generation",
+                        "state": "done",
+                        "label": "Generating answer (superseded by tool call)",
+                        "meta": {
+                            "duration_ms": round(
+                                (time.perf_counter() - llm_start) * 1000, 2
+                            )
+                        },
+                    }
                     generation_started = False
                     full_answer = ""
                 tools_completed = False  # block token capture until this tool ends
