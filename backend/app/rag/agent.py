@@ -187,7 +187,7 @@ async def run_agent_stream(
     from langchain.agents import create_agent
 
     from app.rag.agent_tools import make_tools
-    from app.rag.engine import RAG_PROMPT_K, RAGEngine
+    from app.rag.engine import RAGEngine
 
     # Share the same RAGEngine instance so tools call the identical
     # embedding, search, and metadata methods as the normal pipeline.
@@ -423,9 +423,10 @@ async def run_agent_stream(
         else:
             ticket_link = None
 
-    # Report the number of chunks actually shown to the LLM in the tool output
-    # (mirroring the normal pipeline which caps at RAG_PROMPT_K).
-    prompt_context_count = min(len(retrieved_docs), RAG_PROMPT_K)
+    # The agent forwards ALL retrieved docs to the LLM via the tool output —
+    # no RAG_PROMPT_K cap applies here (unlike the normal pipeline which builds
+    # a trimmed prompt).  Report the true count so analytics reflect reality.
+    prompt_context_count = len(retrieved_docs)
 
     yield "final", {
         "answer": full_answer,
