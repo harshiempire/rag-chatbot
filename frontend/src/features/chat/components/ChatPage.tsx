@@ -17,6 +17,7 @@ import { useSaveSessionMutation } from '../hooks/useSaveSessionMutation';
 import { useSendMessageMutation } from '../hooks/useSendMessageMutation';
 import { useDeleteSessionMutation } from '../hooks/useDeleteSessionMutation';
 import { RAG_DEFAULT_SOURCE_ID, RAG_DEFAULT_TOP_K } from '../../../shared/api/config';
+import { agentChatTransport } from '../../../shared/api/agentChatTransport';
 import { useAuth } from '../../auth/context/AuthContext';
 
 import { Sidebar } from './layout/Sidebar';
@@ -392,6 +393,7 @@ export function ChatPage() {
   const sessionsQuery = useChatSessionsQuery(userId);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [provider, setProvider] = useState<LLMProvider>('local');
+  const [routerMode, setRouterMode] = useState<'normal' | 'langchain'>('normal');
   const [_composerError, setComposerError] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isNewChatMode, setIsNewChatMode] = useState(false);
@@ -409,7 +411,7 @@ export function ChatPage() {
     shouldFetchSelectedSession,
   );
   const saveSessionMutation = useSaveSessionMutation(userId);
-  const sendMessageMutation = useSendMessageMutation();
+  const sendMessageMutation = useSendMessageMutation(routerMode === 'langchain' ? agentChatTransport : undefined);
   const deleteSessionMutation = useDeleteSessionMutation(userId);
 
   const [state, dispatch] = useReducer(chatReducer, initialState);
@@ -625,6 +627,11 @@ export function ChatPage() {
             receivedDoneEvent = true;
             dispatchStreamAction({ type: 'complete', messageId: assistantMessageId });
           }
+
+          // Agent-only events — no UI action needed, just acknowledge
+          if (event.type === 'tool_call' || event.type === 'tool_result') {
+            return;
+          }
         },
       });
 
@@ -780,6 +787,28 @@ export function ChatPage() {
                   <option value="google">Google Gemini</option>
                   <option value="openrouter">OpenRouter</option>
                 </select>
+                <div className="flex items-center gap-1 bg-slate-900/50 border border-slate-800 rounded-md p-0.5">
+                  <button
+                    onClick={() => setRouterMode('normal')}
+                    className={`text-xs px-2 py-0.5 rounded transition-colors ${
+                      routerMode === 'normal'
+                        ? 'bg-blue-600 text-white'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Normal
+                  </button>
+                  <button
+                    onClick={() => setRouterMode('langchain')}
+                    className={`text-xs px-2 py-0.5 rounded transition-colors ${
+                      routerMode === 'langchain'
+                        ? 'bg-violet-600 text-white'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    LangChain
+                  </button>
+                </div>
               </div>
             </div>
           </div>
