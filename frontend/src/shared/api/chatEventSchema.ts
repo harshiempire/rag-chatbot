@@ -4,7 +4,7 @@ import type { ChatEvent } from '../types/chat';
 const statusEventSchema = z.object({
   type: z.literal('status'),
   data: z.object({
-    stage: z.enum(['routing', 'embedding', 'retrieval', 'prompt_build', 'generation']),
+    stage: z.enum(['routing', 'embedding', 'retrieval', 'prompt_build', 'generation', 'agent']),
     state: z.enum(['start', 'done']),
     label: z.string(),
     meta: z.any().optional(),
@@ -55,6 +55,23 @@ const doneEventSchema = z.object({
   data: z.record(z.never()).or(z.object({})),
 });
 
+// Agent-only events — passed through so the parser doesn't drop them
+const toolCallEventSchema = z.object({
+  type: z.literal('tool_call'),
+  data: z.object({
+    tool: z.string(),
+    input: z.string(),
+  }),
+});
+
+const toolResultEventSchema = z.object({
+  type: z.literal('tool_result'),
+  data: z.object({
+    output: z.string(),
+    count: z.number(),
+  }),
+});
+
 export const chatEventSchema = z.discriminatedUnion('type', [
   statusEventSchema,
   tokenEventSchema,
@@ -62,6 +79,8 @@ export const chatEventSchema = z.discriminatedUnion('type', [
   finalEventSchema,
   errorEventSchema,
   doneEventSchema,
+  toolCallEventSchema,
+  toolResultEventSchema,
 ]);
 
 export const parseChatEvent = (value: unknown): ChatEvent | null => {

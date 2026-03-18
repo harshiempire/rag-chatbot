@@ -1,7 +1,7 @@
 export type LLMProvider = 'openai' | 'anthropic' | 'google' | 'openrouter' | 'local';
 export type DataClassification = 'public' | 'internal' | 'confidential' | 'restricted';
 
-export type PipelineStage = 'routing' | 'embedding' | 'retrieval' | 'prompt_build' | 'generation';
+export type PipelineStage = 'routing' | 'embedding' | 'retrieval' | 'prompt_build' | 'generation' | 'agent';
 export type PipelineState = 'start' | 'done';
 
 export interface PipelineStatusItem {
@@ -74,7 +74,24 @@ export interface DoneEvent {
   data: Record<string, never>;
 }
 
-export type ChatEvent = StatusEvent | TokenEvent | SourceEvent | FinalEvent | ErrorEvent | DoneEvent;
+// Agent-only events (emitted by /rag/agent/stream/events, ignored in normal flow)
+export interface ToolCallEvent {
+  type: 'tool_call';
+  data: {
+    tool: string;
+    input: string;
+  };
+}
+
+export interface ToolResultEvent {
+  type: 'tool_result';
+  data: {
+    output: string;
+    count: number;
+  };
+}
+
+export type ChatEvent = StatusEvent | TokenEvent | SourceEvent | FinalEvent | ErrorEvent | DoneEvent | ToolCallEvent | ToolResultEvent;
 
 export interface RAGStreamRequest {
   question: string;
